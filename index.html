@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Studio Team Board</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, ui-sans-serif, system-ui, sans-serif; background: #f4f5f7; color: #1c1f26; }
+  input, select { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
+
+const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DEFAULT_DAILY = [8, 8, 8, 8, 8, 0, 0];
+const URL_KEY = "studio-board-apiurl";
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const todayStart = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
+const dayIndexToday = () => (new Date().getDay() + 6) % 7;
+const daysUntil = (dateStr) => Math.round((new Date(dateStr + "T00:00:00") - todayStart()) / 86400000);
+
+const TIERS = [
+  { key: "overdue", label: "Overdue", color: "#7c2d12", bg: "#fef2f2", ring: "#b91c1c" },
+  { key: "critical", label: "Critical", color: "#991b1b", bg: "#fee2e2", ring: "#dc2626" },
+  { key: "high", label: "High", color: "#9a3412", bg: "#ffedd5", ring: "#ea580c" },
+  { key: "medium", label: "Medium", color: "#92400e", bg: "#fef3c7", ring: "#d97706" },
+  { key: "low", label: "Low", color: "#166534", bg: "#dcfce7", ring: "#16a34a" },
+];
+const tierInfo = (k) => TIERS.find((t) => t.key === k) || TIERS[4];
+
+const STATUS = {
+  on_track: { label: "On track", color: "#166534", bg: "#dcfce7" },
+  blocked: { label: "Blocked", color: "#991b1b", bg: "#fee2e2" },
+  needs_meeting: { label: "Needs meeting", color: "#7c2d12", bg: "#ffedd5" },
+};
+
+function computePriority(daysLeft, settings) {
+  if (daysLeft < 0) return "overdue";
+  if (daysLeft <= settings.criticalDays) return "critical";
+  if (daysLeft <= settings.highDays) return "high";
+  if (daysLeft <= settings.mediumDays) return "medium";
+  return "low";
+}
+
+const toMin = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
+function remainingWorkHours(now, settings) {
+  const shiftStart = toMin(settings.shiftStart), shiftEnd = toMin(settings.shiftEnd);
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const breaks = [...settings.breaks].sort((a, b) => toMin(a.start) - toMin(b.start));
+  let segments = [[shiftStart, shiftEnd]];
+  breaks.forEach((b) => {
+    const bs = toMin(b.start), be = toMin(b.end);
+    segments = segments.flatMap(([s, e]) => {
+      if (be <= s || bs >= e) return [[s, e]];
+      const out = [];
+      if (bs > s) out.push([s, bs]);
+      if (be < e) out.push([be, e]);
+      return out;
+    });
+  });
+  let total = 0, remaining = 0;
+  segments.forEach(([s, e]) => {
+    total += (e - s);
+    if (nowMin <= s) remaining += (e - s);
+    else if (nowMin < e) remaining += (e - nowMin);
+  });
+  return { totalHours: total / 60, remainingHours: Math.max(remaining / 60, 0) };
+}
+
+const defaultSettings = () => ({
+  criticalDays: 0, highDays: 1, mediumDays: 3,
+  shiftStart: "10:30", shiftEnd: "20:30",
+  breaks: [{ start: "13:30", end: "14:30", label: "Lunch" }, { start: "16:30", end: "17:30", label: "Training" }],
+  ownerPasscode: "",
+});
+
+// ---------- backend (Google Apps Script) ----------
+async function apiLoad(apiUrl) {
+  const res = await fetch(apiUrl, { method: "GET" });
+  const text = await res.text();
+  return JSON.parse(text || "{}");
+}
+async function apiSave(apiUrl, data) {
+  await fetch(apiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids CORS preflight against Apps Script
+    body: JSON.stringify(data),
+  });
+}
+
+function StudioBoard({ apiUrl, onDisconnect }) {
+  const [members, setMembers] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [settings, setSettings] = useState(defaultSettings());
+  const [loaded, setLoaded] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState("");
+  const skipNextPush = useRef(false);
+
+  const [session, setSession] = useState(null);
+  const [tab, setTab] = useState("dashboard");
+  const [showSettings, setShowSettings] = useState(false);
+  const [now, setNow] = useState(new Date());
+  const [form, setForm] = useState({ name: "", client: "", hours: "", deadline: "", assignedTo: "" });
+  const [newMember, setNewMember] = useState({ name: "", email: "", role: "" });
+
+  async function pull() {
+    try {
+      const data = await apiLoad(apiUrl);
+      skipNextPush.current = true;
+      if (data.members) setMembers(data.members);
+      if (data.projects) setProjects(data.projects);
+      if (data.settings) setSettings({ ...defaultSettings(), ...data.settings });
+      setSyncError("");
+    } catch (e) { setSyncError("Couldn't reach the sheet — check your internet connection."); }
+  }
+
+  useEffect(() => { pull().then(() => setLoaded(true)); }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (skipNextPush.current) { skipNextPush.current = false; return; }
+    setSyncing(true);
+    const t = setTimeout(() => {
+      apiSave(apiUrl, { members, projects, settings }).finally(() => setSyncing(false));
+    }, 600); // debounce rapid edits
+    return () => clearTimeout(t);
+  }, [members, projects, settings, loaded]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    const t = setInterval(pull, 20000);
+    return () => clearInterval(t);
+  }, []);
+
+  const workClock = useMemo(() => remainingWorkHours(now, settings), [now, settings]);
+
+  const enriched = useMemo(() => projects.map((p) => {
+    const daysLeft = daysUntil(p.deadline);
+    const tier = computePriority(daysLeft, settings);
+    const pace = p.hours / Math.max(daysLeft, 1);
+    return { ...p, daysLeft, tier, pace };
+  }), [projects, settings]);
+
+  const activeByMember = (memberId) => enriched.filter((p) => p.assignedTo === memberId && p.lifecycle !== "done");
+  const todayIdx = dayIndexToday();
+
+  const memberLoad = (m) => {
+    const active = activeByMember(m.id);
+    const weekCap = m.daily.reduce((a, b) => a + Number(b || 0), 0);
+    const weekCommitted = active.reduce((a, p) => a + Number(p.hours || 0), 0);
+    const standardCap = m.daily[todayIdx] || 0;
+    const todayCapNow = standardCap > 0 ? Math.round((standardCap / workClock.totalHours) * workClock.remainingHours * 10) / 10 : 0;
+    const todayCommitted = active.reduce((a, p) => a + p.pace, 0);
+    return {
+      weekCap, weekAvail: Math.round((weekCap - weekCommitted) * 10) / 10,
+      standardCap, todayCapNow,
+      todayCommitted: Math.round(todayCommitted * 10) / 10,
+      todayAvail: Math.round((todayCapNow - todayCommitted) * 10) / 10,
+      active,
+    };
+  };
+
+  const isOwner = session?.role === "owner";
+  const currentMember = session?.role === "teammate" ? members.find((m) => m.id === session.memberId) : null;
+
+  function addProject(e) {
+    e.preventDefault();
+    if (!form.name || !form.hours || !form.deadline) return;
+    setProjects((ps) => [...ps, { id: uid(), name: form.name, client: form.client, hours: Number(form.hours), deadline: form.deadline, assignedTo: form.assignedTo || null, status: "on_track", lifecycle: "active", comments: [] }]);
+    setForm({ name: "", client: "", hours: "", deadline: "", assignedTo: "" });
+  }
+  function removeProject(id) { setProjects((ps) => ps.filter((p) => p.id !== id)); }
+  function toggleDone(id) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, lifecycle: p.lifecycle === "done" ? "active" : "done" } : p)); }
+  function reassign(id, memberId) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, assignedTo: memberId || null } : p)); }
+  function setProjectStatus(id, status) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, status } : p)); }
+  function addComment(id, author, text) {
+    if (!text.trim()) return;
+    setProjects((ps) => ps.map((p) => p.id === id ? { ...p, comments: [...(p.comments || []), { author, text, at: new Date().toISOString() }] } : p));
+  }
+  function addMember() {
+    if (!newMember.name || !newMember.email) return;
+    setMembers((ms) => [...ms, { id: uid(), name: newMember.name, email: newMember.email, role: newMember.role, daily: [...DEFAULT_DAILY] }]);
+    setNewMember({ name: "", email: "", role: "" });
+  }
+  function removeMember(id) { setMembers((ms) => ms.filter((m) => m.id !== id)); }
+  function updateMember(id, patch) { setMembers((ms) => ms.map((m) => m.id === id ? { ...m, ...patch } : m)); }
+  function updateMemberDay(id, dayIdx, val) { setMembers((ms) => ms.map((m) => m.id === id ? { ...m, daily: m.daily.map((d, i) => i === dayIdx ? Number(val) : d) } : m)); }
+
+  const sortedProjects = [...enriched].sort((a, b) => {
+    const order = { overdue: 0, critical: 1, high: 2, medium: 3, low: 4 };
+    return order[a.tier] - order[b.tier] || a.daysLeft - b.daysLeft;
+  });
+
+  if (!loaded) return <div style={{ padding: 40, color: "#9ca3af" }}>Loading from your sheet…</div>;
+  if (!session) return <LoginScreen members={members} settings={settings} setSettings={setSettings} onLogin={setSession} />;
+
+  return (
+    <div style={{ maxWidth: 1120, margin: "0 auto", padding: "28px 20px 60px" }}>
+      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24, flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 12, letterSpacing: "0.14em", textTransform: "uppercase", color: "#6b7280", fontWeight: 600 }}>Studio Ops</div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, margin: "2px 0 0", letterSpacing: "-0.02em" }}>Team Board</h1>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 12.5, color: "#6b7280" }}>{isOwner ? "Owner" : currentMember?.name} · {workClock.remainingHours.toFixed(1)}h left in shift</div>
+          <div style={{ fontSize: 11.5, color: syncError ? "#dc2626" : "#9ca3af" }}>{syncError || (syncing ? "Saving…" : "Synced ✓")}</div>
+          {isOwner && <button onClick={() => setShowSettings((s) => !s)} style={btnGhost}>⚙ Rules</button>}
+          <button onClick={() => setSession(null)} style={btnGhost}>Log out</button>
+          <button onClick={onDisconnect} style={btnGhost}>Change sheet</button>
+        </div>
+      </header>
+
+      {showSettings && isOwner && (
+        <div style={{ ...card, marginBottom: 20, background: "#fff" }}>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Priority rules</div>
+          <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 20 }}>
+            <SettingField label="Critical: due within (days)" value={settings.criticalDays} onChange={(v) => setSettings((s) => ({ ...s, criticalDays: v }))} />
+            <SettingField label="High: due within (days)" value={settings.highDays} onChange={(v) => setSettings((s) => ({ ...s, highDays: v }))} />
+            <SettingField label="Medium: due within (days)" value={settings.mediumDays} onChange={(v) => setSettings((s) => ({ ...s, mediumDays: v }))} />
+          </div>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Working hours (real-time)</div>
+          <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 14 }}>
+            <TimeField label="Shift start" value={settings.shiftStart} onChange={(v) => setSettings((s) => ({ ...s, shiftStart: v }))} />
+            <TimeField label="Shift end" value={settings.shiftEnd} onChange={(v) => setSettings((s) => ({ ...s, shiftEnd: v }))} />
+          </div>
+          {settings.breaks.map((b, i) => (
+            <div key={i} style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 10 }}>
+              <TimeField label={`${b.label} start`} value={b.start} onChange={(v) => setSettings((s) => { const bs = [...s.breaks]; bs[i] = { ...bs[i], start: v }; return { ...s, breaks: bs }; })} />
+              <TimeField label={`${b.label} end`} value={b.end} onChange={(v) => setSettings((s) => { const bs = [...s.breaks]; bs[i] = { ...bs[i], end: v }; return { ...s, breaks: bs }; })} />
+            </div>
+          ))}
+          <div style={{ borderTop: "1px solid #f1f2f4", marginTop: 16, paddingTop: 14 }}>
+            <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 13.5 }}>Owner passcode</div>
+            <input type="text" value={settings.ownerPasscode} onChange={(e) => setSettings((s) => ({ ...s, ownerPasscode: e.target.value }))} style={{ ...input, width: 220 }} />
+          </div>
+        </div>
+      )}
+
+      <nav style={{ display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap" }}>
+        <TabBtn active={tab === "dashboard"} onClick={() => setTab("dashboard")} label="▦ Dashboard" />
+        <TabBtn active={tab === "projects"} onClick={() => setTab("projects")} label="◷ Projects" />
+        {isOwner && <TabBtn active={tab === "team"} onClick={() => setTab("team")} label="◍ Team setup" />}
+      </nav>
+
+      {tab === "dashboard" && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
+          {members.map((m) => {
+            const load = memberLoad(m);
+            return (
+              <div key={m.id} style={{ ...card, ...(currentMember?.id === m.id ? { borderColor: "#c7d2fe", boxShadow: "0 0 0 2px #eef2ff" } : {}) }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                  <div style={{ fontWeight: 700, fontSize: 16 }}>{m.name}</div>
+                  {m.role && <div style={{ fontSize: 12, color: "#9ca3af" }}>{m.role}</div>}
+                </div>
+                <div style={{ display: "flex", gap: 10, margin: "14px 0" }}>
+                  <StatBlock label="Available right now" value={`${load.todayAvail}h`} sub={`of ${load.todayCapNow}h left in shift`} warn={load.todayAvail < 0} />
+                  <StatBlock label="This week available" value={`${load.weekAvail}h`} sub={`of ${load.weekCap}h`} warn={load.weekAvail < 0} />
+                </div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>ASSIGNED PROJECTS</div>
+                {load.active.length === 0 && <div style={{ fontSize: 13, color: "#9ca3af" }}>Nothing assigned — free capacity.</div>}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {load.active.sort((a, b) => a.daysLeft - b.daysLeft).map((p) => {
+                    const t = tierInfo(p.tier); const st = STATUS[p.status] || STATUS.on_track;
+                    return (
+                      <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, padding: "6px 8px", borderRadius: 8, background: "#fafafa", gap: 6 }}>
+                        <span style={{ fontWeight: 600 }}>{p.name}</span>
+                        <span style={{ display: "flex", gap: 6, alignItems: "center", color: "#6b7280", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                          {p.daysLeft < 0 ? "overdue" : p.daysLeft === 0 ? "today" : `${p.daysLeft}d left`}
+                          <Chip tier={t} />
+                          <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 999, color: st.color, background: st.bg }}>{st.label}</span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+          {members.length === 0 && <div style={{ ...card, color: "#9ca3af" }}>No team members yet. {isOwner ? "Add them under Team setup." : "Ask the owner to add the team."}</div>}
+        </div>
+      )}
+
+      {tab === "projects" && (
+        <div>
+          {isOwner && (
+            <form onSubmit={addProject} style={{ ...card, marginBottom: 18, display: "grid", gridTemplateColumns: "1.4fr 1fr 0.7fr 0.9fr 1fr auto", gap: 10, alignItems: "end" }}>
+              <Field label="Project name"><input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} style={input} placeholder="Brand shoot v2" /></Field>
+              <Field label="Client (optional)"><input value={form.client} onChange={(e) => setForm((f) => ({ ...f, client: e.target.value }))} style={input} placeholder="Acme Co." /></Field>
+              <Field label="Hours needed"><input type="number" min="0" step="0.5" value={form.hours} onChange={(e) => setForm((f) => ({ ...f, hours: e.target.value }))} style={input} placeholder="12" /></Field>
+              <Field label="Deadline"><input type="date" value={form.deadline} onChange={(e) => setForm((f) => ({ ...f, deadline: e.target.value }))} style={input} /></Field>
+              <Field label="Assign to">
+                <select value={form.assignedTo} onChange={(e) => setForm((f) => ({ ...f, assignedTo: e.target.value }))} style={input}>
+                  <option value="">Unassigned</option>
+                  {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select>
+              </Field>
+              <button type="submit" style={btnPrimary}>+ Add</button>
+            </form>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {sortedProjects.length === 0 && <div style={{ ...card, color: "#9ca3af", textAlign: "center" }}>No projects yet.</div>}
+            {sortedProjects.map((p) => {
+              const t = tierInfo(p.tier);
+              const canEditStatus = isOwner || currentMember?.id === p.assignedTo;
+              return (
+                <div key={p.id} style={{ ...card, opacity: p.lifecycle === "done" ? 0.55 : 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                    {isOwner && (
+                      <button onClick={() => toggleDone(p.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: p.lifecycle === "done" ? "#16a34a" : "#d1d5db" }}>{p.lifecycle === "done" ? "✓" : "○"}</button>
+                    )}
+                    <div style={{ width: 78 }}><Chip tier={t} big /></div>
+                    <div style={{ flex: 1, minWidth: 180 }}>
+                      <div style={{ fontWeight: 700, textDecoration: p.lifecycle === "done" ? "line-through" : "none" }}>{p.name}</div>
+                      <div style={{ fontSize: 12.5, color: "#9ca3af" }}>{p.client && `${p.client} · `}{p.hours}h needed · {p.pace.toFixed(1)}h/day pace · {p.daysLeft < 0 ? `${-p.daysLeft}d overdue` : p.daysLeft === 0 ? "due today" : `due in ${p.daysLeft}d`} · {members.find((m) => m.id === p.assignedTo)?.name || "Unassigned"}</div>
+                    </div>
+                    {canEditStatus && (
+                      <select value={p.status} onChange={(e) => setProjectStatus(p.id, e.target.value)} style={{ ...input, width: 150 }}>
+                        {Object.entries(STATUS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                      </select>
+                    )}
+                    {isOwner && (
+                      <select value={p.assignedTo || ""} onChange={(e) => reassign(p.id, e.target.value)} style={{ ...input, width: 150 }}>
+                        <option value="">Unassigned</option>
+                        {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                      </select>
+                    )}
+                    {isOwner && <button onClick={() => removeProject(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", fontSize: 16 }}>🗑</button>}
+                  </div>
+                  <CommentBox project={p} onAdd={(text) => addComment(p.id, isOwner ? "Owner" : currentMember?.name, text)} />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {tab === "team" && isOwner && (
+        <div>
+          <div style={{ ...card, marginBottom: 16, display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 10, alignItems: "end" }}>
+            <Field label="Name"><input value={newMember.name} onChange={(e) => setNewMember((f) => ({ ...f, name: e.target.value }))} style={input} /></Field>
+            <Field label="Email"><input type="email" value={newMember.email} onChange={(e) => setNewMember((f) => ({ ...f, email: e.target.value }))} style={input} /></Field>
+            <Field label="Role (optional)"><input value={newMember.role} onChange={(e) => setNewMember((f) => ({ ...f, role: e.target.value }))} style={input} placeholder="Editor, Designer, Manager..." /></Field>
+            <button onClick={addMember} style={btnPrimary}>+ Add teammate</button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
+            {members.map((m) => (
+              <div key={m.id} style={card}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start" }}>
+                  <div style={{ flex: 1 }}>
+                    <Field label="Name"><input value={m.name} onChange={(e) => updateMember(m.id, { name: e.target.value })} style={input} /></Field>
+                    <div style={{ height: 10 }} />
+                    <Field label="Email"><input value={m.email} onChange={(e) => updateMember(m.id, { email: e.target.value })} style={input} /></Field>
+                    <div style={{ height: 10 }} />
+                    <Field label="Role"><input value={m.role} onChange={(e) => updateMember(m.id, { role: e.target.value })} style={input} /></Field>
+                  </div>
+                  <button onClick={() => removeMember(m.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", marginLeft: 8, fontSize: 15 }}>🗑</button>
+                </div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", margin: "16px 0 8px" }}>STANDARD DAILY CAPACITY (hours)</div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {DAY_LABELS.map((d, i) => (
+                    <div key={d} style={{ flex: 1, textAlign: "center" }}>
+                      <div style={{ fontSize: 10.5, color: "#9ca3af", marginBottom: 3, fontWeight: 600 }}>{d}</div>
+                      <input type="number" min="0" max="24" value={m.daily[i]} onChange={(e) => updateMemberDay(m.id, i, e.target.value)} style={{ ...input, padding: "6px 2px", textAlign: "center", fontSize: 12.5 }} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CommentBox({ project, onAdd }) {
+  const [text, setText] = useState("");
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f2f4" }}>
+      {(project.comments || []).length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 8 }}>
+          {project.comments.map((c, i) => (<div key={i} style={{ fontSize: 12.5, color: "#4b5563" }}><strong>{c.author}:</strong> {c.text}</div>))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8 }}>
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Comment or note for the owner…" style={{ ...input, fontSize: 12.5 }} onKeyDown={(e) => { if (e.key === "Enter") { onAdd(text); setText(""); } }} />
+        <button onClick={() => { onAdd(text); setText(""); }} style={{ ...btnGhost, padding: "6px 10px" }}>💬</button>
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ members, settings, setSettings, onLogin }) {
+  const [mode, setMode] = useState(settings.ownerPasscode ? "choose" : "setup");
+  const [passcode, setPasscode] = useState("");
+  const [error, setError] = useState("");
+  const [pick, setPick] = useState("");
+  const [email, setEmail] = useState("");
+
+  if (mode === "setup") {
+    return (<Centered><div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Set up owner access</div>
+      <p style={{ fontSize: 13.5, color: "#6b7280", marginBottom: 16 }}>First time here — set a passcode for owner controls.</p>
+      <input type="password" value={passcode} onChange={(e) => setPasscode(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="Choose a passcode" />
+      <button style={btnPrimary} onClick={() => { if (passcode) { setSettings((s) => ({ ...s, ownerPasscode: passcode })); onLogin({ role: "owner" }); } }}>Continue as Owner</button>
+    </Centered>);
+  }
+  if (mode === "choose") {
+    return (<Centered><div style={{ fontWeight: 800, fontSize: 20, marginBottom: 16 }}>Log in</div>
+      <button style={{ ...btnPrimary, width: "100%", marginBottom: 10 }} onClick={() => setMode("owner")}>🔒 Owner login</button>
+      <button style={{ ...btnGhost, width: "100%", justifyContent: "center" }} onClick={() => setMode("teammate")}>Teammate login</button>
+    </Centered>);
+  }
+  if (mode === "owner") {
+    return (<Centered><div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Owner login</div>
+      <input type="password" value={passcode} onChange={(e) => setPasscode(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="Passcode" />
+      {error && <div style={{ color: "#dc2626", fontSize: 12.5, marginBottom: 8 }}>{error}</div>}
+      <button style={{ ...btnPrimary, width: "100%" }} onClick={() => { if (passcode === settings.ownerPasscode) onLogin({ role: "owner" }); else setError("Incorrect passcode."); }}>Log in</button>
+      <button style={{ ...btnGhost, width: "100%", justifyContent: "center", marginTop: 8 }} onClick={() => setMode("choose")}>Back</button>
+    </Centered>);
+  }
+  return (<Centered><div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Teammate login</div>
+    <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>Pick your name and confirm your email — no password needed.</p>
+    <select value={pick} onChange={(e) => setPick(e.target.value)} style={{ ...input, marginBottom: 10 }}>
+      <option value="">Select your name</option>
+      {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+    </select>
+    <input value={email} onChange={(e) => setEmail(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="Your email" />
+    {error && <div style={{ color: "#dc2626", fontSize: 12.5, marginBottom: 8 }}>{error}</div>}
+    <button style={{ ...btnPrimary, width: "100%" }} onClick={() => {
+      const m = members.find((x) => x.id === pick);
+      if (!m) { setError("Pick your name."); return; }
+      if (m.email.trim().toLowerCase() !== email.trim().toLowerCase()) { setError("Email doesn't match — check with the owner."); return; }
+      onLogin({ role: "teammate", memberId: m.id });
+    }}>Log in</button>
+    <button style={{ ...btnGhost, width: "100%", justifyContent: "center", marginTop: 8 }} onClick={() => setMode("choose")}>Back</button>
+  </Centered>);
+}
+
+function ConnectScreen({ onConnect }) {
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+  return (
+    <Centered wide>
+      <div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Connect your Google Sheet</div>
+      <p style={{ fontSize: 13.5, color: "#6b7280", marginBottom: 14, lineHeight: 1.5 }}>Paste the Web App URL from your Apps Script deployment (see setup instructions).</p>
+      <input value={url} onChange={(e) => setUrl(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="https://script.google.com/macros/s/.../exec" />
+      {error && <div style={{ color: "#dc2626", fontSize: 12.5, marginBottom: 8 }}>{error}</div>}
+      <button style={{ ...btnPrimary, width: "100%" }} disabled={checking} onClick={async () => {
+        setChecking(true); setError("");
+        try { await apiLoad(url); localStorage.setItem(URL_KEY, url); onConnect(url); }
+        catch (e) { setError("Couldn't connect — double check the URL and that the deployment is set to \"Anyone\" access."); }
+        setChecking(false);
+      }}>{checking ? "Connecting…" : "Connect"}</button>
+    </Centered>
+  );
+}
+
+function Centered({ children, wide }) {
+  return (<div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}><div style={{ ...card, width: wide ? 420 : 340 }}>{children}</div></div>);
+}
+function Chip({ tier, big }) {
+  return (<span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: big ? 11.5 : 11, fontWeight: 700, padding: big ? "4px 9px" : "2px 8px", borderRadius: 999, color: tier.color, background: tier.bg, border: `1px solid ${tier.ring}33`, whiteSpace: "nowrap" }}>{tier.key === "overdue" && "⚠ "}{tier.label}</span>);
+}
+function StatBlock({ label, value, sub, warn }) {
+  return (<div style={{ flex: 1, background: warn ? "#fef2f2" : "#f9fafb", border: `1px solid ${warn ? "#fecaca" : "#f1f2f4"}`, borderRadius: 10, padding: "10px 12px" }}>
+    <div style={{ fontSize: 10.5, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+    <div style={{ fontSize: 19, fontWeight: 800, color: warn ? "#b91c1c" : "#1c1f26", lineHeight: 1.3 }}>{value}</div>
+    <div style={{ fontSize: 11, color: "#9ca3af" }}>{sub}</div>
+  </div>);
+}
+function Field({ label, children }) { return (<div><div style={{ fontSize: 11.5, fontWeight: 600, color: "#6b7280", marginBottom: 5 }}>{label}</div>{children}</div>); }
+function SettingField({ label, value, onChange }) { return (<div><div style={{ fontSize: 12, fontWeight: 600, color: "#6b7280", marginBottom: 5 }}>{label}</div><input type="number" min="0" value={value} onChange={(e) => onChange(Number(e.target.value))} style={{ ...input, width: 90 }} /></div>); }
+function TimeField({ label, value, onChange }) { return (<div><div style={{ fontSize: 12, fontWeight: 600, color: "#6b7280", marginBottom: 5 }}>{label}</div><input type="time" value={value} onChange={(e) => onChange(e.target.value)} style={{ ...input, width: 120 }} /></div>); }
+function TabBtn({ active, onClick, label }) { return (<button onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 6, padding: "9px 16px", borderRadius: 10, border: "none", cursor: "pointer", fontSize: 13.5, fontWeight: 700, background: active ? "#1c1f26" : "#e9eaee", color: active ? "#fff" : "#4b5563" }}>{label}</button>); }
+
+const card = { background: "#fff", border: "1px solid #ececee", borderRadius: 14, padding: 18, boxShadow: "0 1px 2px rgba(0,0,0,0.02)" };
+const input = { width: "100%", padding: "8px 10px", borderRadius: 8, border: "1px solid #e2e3e7", fontSize: 13.5, fontFamily: "inherit", outline: "none", boxSizing: "border-box" };
+const btnPrimary = { display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "#1c1f26", color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 13.5, cursor: "pointer", height: 38 };
+const btnGhost = { display: "flex", alignItems: "center", gap: 6, background: "#fff", border: "1px solid #e2e3e7", borderRadius: 9, padding: "8px 14px", fontWeight: 600, fontSize: 13, cursor: "pointer", color: "#4b5563" };
+
+function App() {
+  const [apiUrl, setApiUrl] = useState(localStorage.getItem(URL_KEY) || "");
+  if (!apiUrl) return <ConnectScreen onConnect={setApiUrl} />;
+  return <StudioBoard apiUrl={apiUrl} onDisconnect={() => { localStorage.removeItem(URL_KEY); setApiUrl(""); }} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
