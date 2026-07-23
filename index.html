@@ -24,9 +24,13 @@ const DEFAULT_DAILY = [8, 8, 8, 8, 8, 0, 0];
 const URL_KEY = "studio-board-apiurl";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
+const nowIso = () => new Date().toISOString();
 const todayStart = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
 const dayIndexToday = () => (new Date().getDay() + 6) % 7;
 const daysUntil = (dateStr) => Math.round((new Date(dateStr + "T00:00:00") - todayStart()) / 86400000);
+const isToday = (iso) => new Date(iso).toDateString() === new Date().toDateString();
+const fmtTime = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const fmtDur = (mins) => { const h = Math.floor(mins / 60), m = Math.round(mins % 60); return h > 0 ? `${h}h ${m}m` : `${m}m`; };
 
 const TIERS = [
   { key: "overdue", label: "Overdue", color: "#7c2d12", bg: "#fef2f2", ring: "#b91c1c" },
@@ -83,24 +87,32 @@ const defaultSettings = () => ({
   ownerPasscode: "",
 });
 
-// ---------- backend (Google Apps Script) ----------
 async function apiLoad(apiUrl) {
   const res = await fetch(apiUrl, { method: "GET" });
   const text = await res.text();
   return JSON.parse(text || "{}");
 }
 async function apiSave(apiUrl, data) {
-  await fetch(apiUrl, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids CORS preflight against Apps Script
-    body: JSON.stringify(data),
-  });
+  await fetch(apiUrl, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(data) });
+}
+
+// ---------- time-tracking helpers ----------
+function openEntry(entries, memberId, kind) {
+  return entries.find((e) => e.memberId === memberId && e.kind === kind && !e.endAt);
+}
+function memberDayStatus(entries, memberId) {
+  if (openEntry(entries, memberId, "lunch")) return "on_lunch";
+  const task = openEntry(entries, memberId, "task");
+  if (task) return "on_task";
+  if (openEntry(entries, memberId, "shift")) return "clocked_in";
+  return "clocked_out";
 }
 
 function StudioBoard({ apiUrl, onDisconnect }) {
   const [members, setMembers] = useState([]);
   const [projects, setProjects] = useState([]);
   const [settings, setSettings] = useState(defaultSettings());
+  const [timeEntries, setTimeEntries] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState("");
@@ -112,6 +124,10 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   const [now, setNow] = useState(new Date());
   const [form, setForm] = useState({ name: "", client: "", hours: "", deadline: "", assignedTo: "" });
   const [newMember, setNewMember] = useState({ name: "", email: "", role: "" });
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [expandedLogs, setExpandedLogs] = useState({});
+  const [expandedActivity, setExpandedActivity] = useState({});
 
   async function pull() {
     try {
@@ -120,30 +136,20 @@ function StudioBoard({ apiUrl, onDisconnect }) {
       if (data.members) setMembers(data.members);
       if (data.projects) setProjects(data.projects);
       if (data.settings) setSettings({ ...defaultSettings(), ...data.settings });
+      if (data.timeEntries) setTimeEntries(data.timeEntries);
       setSyncError("");
-    } catch (e) { setSyncError("Couldn't reach the sheet — check your internet connection."); }
+    } catch (e) { setSyncError("Couldn't reach the sheet."); }
   }
-
   useEffect(() => { pull().then(() => setLoaded(true)); }, []);
-
   useEffect(() => {
     if (!loaded) return;
     if (skipNextPush.current) { skipNextPush.current = false; return; }
     setSyncing(true);
-    const t = setTimeout(() => {
-      apiSave(apiUrl, { members, projects, settings }).finally(() => setSyncing(false));
-    }, 600); // debounce rapid edits
+    const t = setTimeout(() => { apiSave(apiUrl, { members, projects, settings, timeEntries }).finally(() => setSyncing(false)); }, 600);
     return () => clearTimeout(t);
-  }, [members, projects, settings, loaded]);
-
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 60000);
-    return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    const t = setInterval(pull, 20000);
-    return () => clearInterval(t);
-  }, []);
+  }, [members, projects, settings, timeEntries, loaded]);
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 30000); return () => clearInterval(t); }, []);
+  useEffect(() => { const t = setInterval(pull, 20000); return () => clearInterval(t); }, []);
 
   const workClock = useMemo(() => remainingWorkHours(now, settings), [now, settings]);
 
@@ -167,7 +173,6 @@ function StudioBoard({ apiUrl, onDisconnect }) {
     return {
       weekCap, weekAvail: Math.round((weekCap - weekCommitted) * 10) / 10,
       standardCap, todayCapNow,
-      todayCommitted: Math.round(todayCommitted * 10) / 10,
       todayAvail: Math.round((todayCapNow - todayCommitted) * 10) / 10,
       active,
     };
@@ -176,11 +181,17 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   const isOwner = session?.role === "owner";
   const currentMember = session?.role === "teammate" ? members.find((m) => m.id === session.memberId) : null;
 
+  // ---- project CRUD ----
   function addProject(e) {
     e.preventDefault();
     if (!form.name || !form.hours || !form.deadline) return;
     setProjects((ps) => [...ps, { id: uid(), name: form.name, client: form.client, hours: Number(form.hours), deadline: form.deadline, assignedTo: form.assignedTo || null, status: "on_track", lifecycle: "active", comments: [] }]);
     setForm({ name: "", client: "", hours: "", deadline: "", assignedTo: "" });
+  }
+  function startEdit(p) { setEditingId(p.id); setEditForm({ name: p.name, client: p.client || "", hours: p.hours, deadline: p.deadline }); }
+  function saveEdit(id) {
+    setProjects((ps) => ps.map((p) => p.id === id ? { ...p, name: editForm.name, client: editForm.client, hours: Number(editForm.hours), deadline: editForm.deadline } : p));
+    setEditingId(null);
   }
   function removeProject(id) { setProjects((ps) => ps.filter((p) => p.id !== id)); }
   function toggleDone(id) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, lifecycle: p.lifecycle === "done" ? "active" : "done" } : p)); }
@@ -188,8 +199,10 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   function setProjectStatus(id, status) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, status } : p)); }
   function addComment(id, author, text) {
     if (!text.trim()) return;
-    setProjects((ps) => ps.map((p) => p.id === id ? { ...p, comments: [...(p.comments || []), { author, text, at: new Date().toISOString() }] } : p));
+    setProjects((ps) => ps.map((p) => p.id === id ? { ...p, comments: [...(p.comments || []), { author, text, at: nowIso() }] } : p));
   }
+
+  // ---- member CRUD ----
   function addMember() {
     if (!newMember.name || !newMember.email) return;
     setMembers((ms) => [...ms, { id: uid(), name: newMember.name, email: newMember.email, role: newMember.role, daily: [...DEFAULT_DAILY] }]);
@@ -198,6 +211,25 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   function removeMember(id) { setMembers((ms) => ms.filter((m) => m.id !== id)); }
   function updateMember(id, patch) { setMembers((ms) => ms.map((m) => m.id === id ? { ...m, ...patch } : m)); }
   function updateMemberDay(id, dayIdx, val) { setMembers((ms) => ms.map((m) => m.id === id ? { ...m, daily: m.daily.map((d, i) => i === dayIdx ? Number(val) : d) } : m)); }
+
+  // ---- time tracking actions ----
+  function clockIn(memberId) { setTimeEntries((te) => [...te, { id: uid(), memberId, kind: "shift", startAt: nowIso(), endAt: null }]); }
+  function clockOut(memberId) {
+    const t = nowIso();
+    setTimeEntries((te) => te.map((e) => (e.memberId === memberId && !e.endAt) ? { ...e, endAt: t } : e));
+  }
+  function startLunch(memberId) {
+    const t = nowIso();
+    setTimeEntries((te) => [...te.map((e) => (e.memberId === memberId && e.kind === "task" && !e.endAt) ? { ...e, endAt: t } : e), { id: uid(), memberId, kind: "lunch", startAt: t, endAt: null }]);
+  }
+  function endLunch(memberId) {
+    const t = nowIso();
+    setTimeEntries((te) => te.map((e) => (e.memberId === memberId && e.kind === "lunch" && !e.endAt) ? { ...e, endAt: t } : e));
+  }
+  function startTask(memberId, taskId) {
+    const t = nowIso();
+    setTimeEntries((te) => [...te.map((e) => (e.memberId === memberId && e.kind === "task" && !e.endAt) ? { ...e, endAt: t } : e), { id: uid(), memberId, kind: "task", taskId, startAt: t, endAt: null }]);
+  }
 
   const sortedProjects = [...enriched].sort((a, b) => {
     const order = { overdue: 0, critical: 1, high: 2, medium: 3, low: 4 };
@@ -256,40 +288,55 @@ function StudioBoard({ apiUrl, onDisconnect }) {
       </nav>
 
       {tab === "dashboard" && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
-          {members.map((m) => {
-            const load = memberLoad(m);
-            return (
-              <div key={m.id} style={{ ...card, ...(currentMember?.id === m.id ? { borderColor: "#c7d2fe", boxShadow: "0 0 0 2px #eef2ff" } : {}) }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-                  <div style={{ fontWeight: 700, fontSize: 16 }}>{m.name}</div>
-                  {m.role && <div style={{ fontSize: 12, color: "#9ca3af" }}>{m.role}</div>}
+        <div>
+          {currentMember && (
+            <MyDayPanel member={currentMember} entries={timeEntries} activeProjects={activeByMember(currentMember.id)}
+              onClockIn={() => clockIn(currentMember.id)} onClockOut={() => clockOut(currentMember.id)}
+              onStartLunch={() => startLunch(currentMember.id)} onEndLunch={() => endLunch(currentMember.id)}
+              onStartTask={(tid) => startTask(currentMember.id, tid)} />
+          )}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
+            {members.map((m) => {
+              const load = memberLoad(m);
+              const status = memberDayStatus(timeEntries, m.id);
+              const todaysEntries = timeEntries.filter((e) => e.memberId === m.id && isToday(e.startAt));
+              const showActivity = expandedActivity[m.id];
+              return (
+                <div key={m.id} style={{ ...card, ...(currentMember?.id === m.id ? { borderColor: "#c7d2fe", boxShadow: "0 0 0 2px #eef2ff" } : {}) }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                    <div style={{ fontWeight: 700, fontSize: 16 }}>{m.name}</div>
+                    <StatusBadge status={status} />
+                  </div>
+                  {m.role && <div style={{ fontSize: 12, color: "#9ca3af", marginBottom: 8 }}>{m.role}</div>}
+                  <div style={{ display: "flex", gap: 10, margin: "14px 0" }}>
+                    <StatBlock label="Available right now" value={`${load.todayAvail}h`} sub={`of ${load.todayCapNow}h left in shift`} warn={load.todayAvail < 0} />
+                    <StatBlock label="This week available" value={`${load.weekAvail}h`} sub={`of ${load.weekCap}h`} warn={load.weekAvail < 0} />
+                  </div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>ASSIGNED PROJECTS</div>
+                  {load.active.length === 0 && <div style={{ fontSize: 13, color: "#9ca3af", marginBottom: 10 }}>Nothing assigned.</div>}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+                    {load.active.sort((a, b) => a.daysLeft - b.daysLeft).map((p) => {
+                      const t = tierInfo(p.tier); const st = STATUS[p.status] || STATUS.on_track;
+                      return (
+                        <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, padding: "6px 8px", borderRadius: 8, background: "#fafafa", gap: 6 }}>
+                          <span style={{ fontWeight: 600 }}>{p.name}</span>
+                          <span style={{ display: "flex", gap: 6, alignItems: "center", color: "#6b7280", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                            {p.daysLeft < 0 ? "overdue" : p.daysLeft === 0 ? "today" : `${p.daysLeft}d left`}
+                            <Chip tier={t} /><span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 999, color: st.color, background: st.bg }}>{st.label}</span>
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <button onClick={() => setExpandedActivity((s) => ({ ...s, [m.id]: !s[m.id] }))} style={{ ...btnGhost, fontSize: 11.5, padding: "5px 10px" }}>
+                    {showActivity ? "Hide today's activity" : `Show today's activity (${todaysEntries.length})`}
+                  </button>
+                  {showActivity && <ActivityLog entries={todaysEntries} projects={projects} />}
                 </div>
-                <div style={{ display: "flex", gap: 10, margin: "14px 0" }}>
-                  <StatBlock label="Available right now" value={`${load.todayAvail}h`} sub={`of ${load.todayCapNow}h left in shift`} warn={load.todayAvail < 0} />
-                  <StatBlock label="This week available" value={`${load.weekAvail}h`} sub={`of ${load.weekCap}h`} warn={load.weekAvail < 0} />
-                </div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>ASSIGNED PROJECTS</div>
-                {load.active.length === 0 && <div style={{ fontSize: 13, color: "#9ca3af" }}>Nothing assigned — free capacity.</div>}
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {load.active.sort((a, b) => a.daysLeft - b.daysLeft).map((p) => {
-                    const t = tierInfo(p.tier); const st = STATUS[p.status] || STATUS.on_track;
-                    return (
-                      <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, padding: "6px 8px", borderRadius: 8, background: "#fafafa", gap: 6 }}>
-                        <span style={{ fontWeight: 600 }}>{p.name}</span>
-                        <span style={{ display: "flex", gap: 6, alignItems: "center", color: "#6b7280", flexWrap: "wrap", justifyContent: "flex-end" }}>
-                          {p.daysLeft < 0 ? "overdue" : p.daysLeft === 0 ? "today" : `${p.daysLeft}d left`}
-                          <Chip tier={t} />
-                          <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 999, color: st.color, background: st.bg }}>{st.label}</span>
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })}
-          {members.length === 0 && <div style={{ ...card, color: "#9ca3af" }}>No team members yet. {isOwner ? "Add them under Team setup." : "Ask the owner to add the team."}</div>}
+              );
+            })}
+            {members.length === 0 && <div style={{ ...card, color: "#9ca3af" }}>No team members yet.</div>}
+          </div>
         </div>
       )}
 
@@ -315,31 +362,64 @@ function StudioBoard({ apiUrl, onDisconnect }) {
             {sortedProjects.map((p) => {
               const t = tierInfo(p.tier);
               const canEditStatus = isOwner || currentMember?.id === p.assignedTo;
+              const comments = p.comments || [];
+              const expanded = expandedLogs[p.id];
+              const isEditing = editingId === p.id;
               return (
                 <div key={p.id} style={{ ...card, opacity: p.lifecycle === "done" ? 0.55 : 1 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-                    {isOwner && (
-                      <button onClick={() => toggleDone(p.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: p.lifecycle === "done" ? "#16a34a" : "#d1d5db" }}>{p.lifecycle === "done" ? "✓" : "○"}</button>
-                    )}
-                    <div style={{ width: 78 }}><Chip tier={t} big /></div>
-                    <div style={{ flex: 1, minWidth: 180 }}>
-                      <div style={{ fontWeight: 700, textDecoration: p.lifecycle === "done" ? "line-through" : "none" }}>{p.name}</div>
-                      <div style={{ fontSize: 12.5, color: "#9ca3af" }}>{p.client && `${p.client} · `}{p.hours}h needed · {p.pace.toFixed(1)}h/day pace · {p.daysLeft < 0 ? `${-p.daysLeft}d overdue` : p.daysLeft === 0 ? "due today" : `due in ${p.daysLeft}d`} · {members.find((m) => m.id === p.assignedTo)?.name || "Unassigned"}</div>
+                  {isEditing ? (
+                    <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 0.7fr 0.9fr auto auto", gap: 10, alignItems: "end" }}>
+                      <Field label="Project name"><input value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} style={input} /></Field>
+                      <Field label="Client"><input value={editForm.client} onChange={(e) => setEditForm((f) => ({ ...f, client: e.target.value }))} style={input} /></Field>
+                      <Field label="Hours"><input type="number" min="0" step="0.5" value={editForm.hours} onChange={(e) => setEditForm((f) => ({ ...f, hours: e.target.value }))} style={input} /></Field>
+                      <Field label="Deadline"><input type="date" value={editForm.deadline} onChange={(e) => setEditForm((f) => ({ ...f, deadline: e.target.value }))} style={input} /></Field>
+                      <button onClick={() => saveEdit(p.id)} style={btnPrimary}>Save</button>
+                      <button onClick={() => setEditingId(null)} style={btnGhost}>Cancel</button>
                     </div>
-                    {canEditStatus && (
-                      <select value={p.status} onChange={(e) => setProjectStatus(p.id, e.target.value)} style={{ ...input, width: 150 }}>
-                        {Object.entries(STATUS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-                      </select>
+                  ) : (
+                    <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                      {isOwner && <button onClick={() => toggleDone(p.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: p.lifecycle === "done" ? "#16a34a" : "#d1d5db" }}>{p.lifecycle === "done" ? "✓" : "○"}</button>}
+                      <div style={{ width: 78 }}><Chip tier={t} big /></div>
+                      <div style={{ flex: 1, minWidth: 180 }}>
+                        <div style={{ fontWeight: 700, textDecoration: p.lifecycle === "done" ? "line-through" : "none" }}>{p.name}</div>
+                        <div style={{ fontSize: 12.5, color: "#9ca3af" }}>{p.client && `${p.client} · `}{p.hours}h needed · {p.pace.toFixed(1)}h/day pace · {p.daysLeft < 0 ? `${-p.daysLeft}d overdue` : p.daysLeft === 0 ? "due today" : `due in ${p.daysLeft}d`} · {members.find((m) => m.id === p.assignedTo)?.name || "Unassigned"}</div>
+                      </div>
+                      {canEditStatus && (
+                        <select value={p.status} onChange={(e) => setProjectStatus(p.id, e.target.value)} style={{ ...input, width: 150 }}>
+                          {Object.entries(STATUS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                        </select>
+                      )}
+                      {isOwner && (
+                        <select value={p.assignedTo || ""} onChange={(e) => reassign(p.id, e.target.value)} style={{ ...input, width: 150 }}>
+                          <option value="">Unassigned</option>
+                          {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                        </select>
+                      )}
+                      {isOwner && <button onClick={() => startEdit(p)} style={btnGhost}>Edit</button>}
+                      {isOwner && <button onClick={() => removeProject(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", fontSize: 16 }}>🗑</button>}
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f2f4" }}>
+                    {comments.length > 0 && (
+                      <div style={{ fontSize: 12.5, color: "#4b5563", marginBottom: 6 }}>
+                        <strong>{comments[comments.length - 1].author}</strong> · <span style={{ color: "#9ca3af" }}>{fmtTime(comments[comments.length - 1].at)}</span> — {comments[comments.length - 1].text}
+                      </div>
                     )}
-                    {isOwner && (
-                      <select value={p.assignedTo || ""} onChange={(e) => reassign(p.id, e.target.value)} style={{ ...input, width: 150 }}>
-                        <option value="">Unassigned</option>
-                        {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
-                      </select>
+                    {comments.length > 1 && (
+                      <button onClick={() => setExpandedLogs((s) => ({ ...s, [p.id]: !s[p.id] }))} style={{ ...btnGhost, fontSize: 11, padding: "4px 9px", marginBottom: 8 }}>
+                        {expanded ? "Hide history" : `Show full history (${comments.length})`}
+                      </button>
                     )}
-                    {isOwner && <button onClick={() => removeProject(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", fontSize: 16 }}>🗑</button>}
+                    {expanded && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 8, background: "#fafafa", padding: 10, borderRadius: 8 }}>
+                        {comments.slice(0, -1).reverse().map((c, i) => (
+                          <div key={i} style={{ fontSize: 12, color: "#6b7280" }}><strong>{c.author}</strong> · {fmtTime(c.at)} — {c.text}</div>
+                        ))}
+                      </div>
+                    )}
+                    <CommentBox onAdd={(text) => addComment(p.id, isOwner ? "Owner" : currentMember?.name, text)} />
                   </div>
-                  <CommentBox project={p} onAdd={(text) => addComment(p.id, isOwner ? "Owner" : currentMember?.name, text)} />
                 </div>
               );
             })}
@@ -386,19 +466,78 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   );
 }
 
-function CommentBox({ project, onAdd }) {
+// ---------- My Day (clock in/out panel) ----------
+function MyDayPanel({ member, entries, activeProjects, onClockIn, onClockOut, onStartLunch, onEndLunch, onStartTask }) {
+  const status = memberDayStatus(entries, member.id);
+  const activeTaskEntry = openEntry(entries, member.id, "task");
+  const activeProject = activeTaskEntry && activeProjects.find((p) => p.id === activeTaskEntry.taskId);
+  const [pickedTask, setPickedTask] = useState("");
+
+  return (
+    <div style={{ ...card, marginBottom: 16, background: "#eef2ff", borderColor: "#c7d2fe" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>My Day</div>
+          <div style={{ fontSize: 12.5, color: "#4b5563" }}>
+            <StatusBadge status={status} /> {activeProject && <span> — working on <strong>{activeProject.name}</strong></span>}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          {status === "clocked_out" && <button onClick={onClockIn} style={btnPrimary}>Clock in</button>}
+          {status !== "clocked_out" && status !== "on_lunch" && <button onClick={onStartLunch} style={btnGhost}>Start lunch</button>}
+          {status === "on_lunch" && <button onClick={onEndLunch} style={btnPrimary}>End lunch</button>}
+          {(status === "clocked_in" || status === "on_task") && (
+            <>
+              <select value={pickedTask} onChange={(e) => setPickedTask(e.target.value)} style={{ ...input, width: 170 }}>
+                <option value="">{status === "on_task" ? "Switch task…" : "Start task…"}</option>
+                {activeProjects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+              <button disabled={!pickedTask} onClick={() => { onStartTask(pickedTask); setPickedTask(""); }} style={btnGhost}>Go</button>
+            </>
+          )}
+          {status !== "clocked_out" && <button onClick={onClockOut} style={{ ...btnGhost, color: "#b91c1c" }}>Clock out</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }) {
+  const map = {
+    clocked_out: { label: "Clocked out", color: "#6b7280", bg: "#f3f4f6" },
+    clocked_in: { label: "Clocked in", color: "#166534", bg: "#dcfce7" },
+    on_lunch: { label: "On lunch", color: "#9a3412", bg: "#ffedd5" },
+    on_task: { label: "Working", color: "#1e3a8a", bg: "#dbeafe" },
+  };
+  const s = map[status] || map.clocked_out;
+  return <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 999, color: s.color, background: s.bg }}>{s.label}</span>;
+}
+
+function ActivityLog({ entries, projects }) {
+  const sorted = [...entries].sort((a, b) => new Date(a.startAt) - new Date(b.startAt));
+  if (sorted.length === 0) return <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 8 }}>No activity logged today.</div>;
+  return (
+    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+      {sorted.map((e) => {
+        const label = e.kind === "shift" ? "Shift" : e.kind === "lunch" ? "Lunch" : (projects.find((p) => p.id === e.taskId)?.name || "Task");
+        const endLabel = e.endAt ? fmtTime(e.endAt) : "now";
+        const mins = ((e.endAt ? new Date(e.endAt) : new Date()) - new Date(e.startAt)) / 60000;
+        return (
+          <div key={e.id} style={{ fontSize: 11.5, color: "#6b7280", display: "flex", justifyContent: "space-between", background: "#fafafa", padding: "4px 8px", borderRadius: 6 }}>
+            <span>{label}</span><span>{fmtTime(e.startAt)}–{endLabel} ({fmtDur(mins)})</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CommentBox({ onAdd }) {
   const [text, setText] = useState("");
   return (
-    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f2f4" }}>
-      {(project.comments || []).length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 8 }}>
-          {project.comments.map((c, i) => (<div key={i} style={{ fontSize: 12.5, color: "#4b5563" }}><strong>{c.author}:</strong> {c.text}</div>))}
-        </div>
-      )}
-      <div style={{ display: "flex", gap: 8 }}>
-        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Comment or note for the owner…" style={{ ...input, fontSize: 12.5 }} onKeyDown={(e) => { if (e.key === "Enter") { onAdd(text); setText(""); } }} />
-        <button onClick={() => { onAdd(text); setText(""); }} style={{ ...btnGhost, padding: "6px 10px" }}>💬</button>
-      </div>
+    <div style={{ display: "flex", gap: 8 }}>
+      <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Log today's progress…" style={{ ...input, fontSize: 12.5 }} onKeyDown={(e) => { if (e.key === "Enter") { onAdd(text); setText(""); } }} />
+      <button onClick={() => { onAdd(text); setText(""); }} style={{ ...btnGhost, padding: "6px 10px" }}>💬</button>
     </div>
   );
 }
@@ -456,25 +595,21 @@ function ConnectScreen({ onConnect }) {
   return (
     <Centered wide>
       <div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Connect your Google Sheet</div>
-      <p style={{ fontSize: 13.5, color: "#6b7280", marginBottom: 14, lineHeight: 1.5 }}>Paste the Web App URL from your Apps Script deployment (see setup instructions).</p>
+      <p style={{ fontSize: 13.5, color: "#6b7280", marginBottom: 14, lineHeight: 1.5 }}>Paste the Web App URL from your Apps Script deployment.</p>
       <input value={url} onChange={(e) => setUrl(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="https://script.google.com/macros/s/.../exec" />
       {error && <div style={{ color: "#dc2626", fontSize: 12.5, marginBottom: 8 }}>{error}</div>}
       <button style={{ ...btnPrimary, width: "100%" }} disabled={checking} onClick={async () => {
         setChecking(true); setError("");
         try { await apiLoad(url); localStorage.setItem(URL_KEY, url); onConnect(url); }
-        catch (e) { setError("Couldn't connect — double check the URL and that the deployment is set to \"Anyone\" access."); }
+        catch (e) { setError("Couldn't connect — double check the URL and access settings."); }
         setChecking(false);
       }}>{checking ? "Connecting…" : "Connect"}</button>
     </Centered>
   );
 }
 
-function Centered({ children, wide }) {
-  return (<div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}><div style={{ ...card, width: wide ? 420 : 340 }}>{children}</div></div>);
-}
-function Chip({ tier, big }) {
-  return (<span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: big ? 11.5 : 11, fontWeight: 700, padding: big ? "4px 9px" : "2px 8px", borderRadius: 999, color: tier.color, background: tier.bg, border: `1px solid ${tier.ring}33`, whiteSpace: "nowrap" }}>{tier.key === "overdue" && "⚠ "}{tier.label}</span>);
-}
+function Centered({ children, wide }) { return (<div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}><div style={{ ...card, width: wide ? 420 : 340 }}>{children}</div></div>); }
+function Chip({ tier, big }) { return (<span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: big ? 11.5 : 11, fontWeight: 700, padding: big ? "4px 9px" : "2px 8px", borderRadius: 999, color: tier.color, background: tier.bg, border: `1px solid ${tier.ring}33`, whiteSpace: "nowrap" }}>{tier.key === "overdue" && "⚠ "}{tier.label}</span>); }
 function StatBlock({ label, value, sub, warn }) {
   return (<div style={{ flex: 1, background: warn ? "#fef2f2" : "#f9fafb", border: `1px solid ${warn ? "#fecaca" : "#f1f2f4"}`, borderRadius: 10, padding: "10px 12px" }}>
     <div style={{ fontSize: 10.5, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
