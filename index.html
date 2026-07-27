@@ -22,15 +22,21 @@ const { useState, useEffect, useMemo, useRef } = React;
 const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const DEFAULT_DAILY = [8, 8, 8, 8, 8, 0, 0];
 const URL_KEY = "studio-board-apiurl";
+const SESSION_KEY = "studio-board-session";
+const SESSION_HOURS = 14;
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const nowIso = () => new Date().toISOString();
 const todayStart = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
+const todayStr = () => new Date().toISOString().slice(0, 10);
 const dayIndexToday = () => (new Date().getDay() + 6) % 7;
 const daysUntil = (dateStr) => Math.round((new Date(dateStr + "T00:00:00") - todayStart()) / 86400000);
 const isToday = (iso) => new Date(iso).toDateString() === new Date().toDateString();
 const fmtTime = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const fmtDate = (iso) => new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
 const fmtDur = (mins) => { const h = Math.floor(mins / 60), m = Math.round(mins % 60); return h > 0 ? `${h}h ${m}m` : `${m}m`; };
+const dateInRange = (d, start, end) => d >= start && d <= end;
+const daysBetweenInclusive = (start, end) => Math.round((new Date(end) - new Date(start)) / 86400000) + 1;
 
 const TIERS = [
   { key: "overdue", label: "Overdue", color: "#7c2d12", bg: "#fef2f2", ring: "#b91c1c" },
@@ -40,13 +46,11 @@ const TIERS = [
   { key: "low", label: "Low", color: "#166534", bg: "#dcfce7", ring: "#16a34a" },
 ];
 const tierInfo = (k) => TIERS.find((t) => t.key === k) || TIERS[4];
-
 const STATUS = {
   on_track: { label: "On track", color: "#166534", bg: "#dcfce7" },
   blocked: { label: "Blocked", color: "#991b1b", bg: "#fee2e2" },
   needs_meeting: { label: "Needs meeting", color: "#7c2d12", bg: "#ffedd5" },
 };
-
 function computePriority(daysLeft, settings) {
   if (daysLeft < 0) return "overdue";
   if (daysLeft <= settings.criticalDays) return "critical";
@@ -54,7 +58,6 @@ function computePriority(daysLeft, settings) {
   if (daysLeft <= settings.mediumDays) return "medium";
   return "low";
 }
-
 const toMin = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
 function remainingWorkHours(now, settings) {
   const shiftStart = toMin(settings.shiftStart), shiftEnd = toMin(settings.shiftEnd);
@@ -77,35 +80,51 @@ function remainingWorkHours(now, settings) {
     if (nowMin <= s) remaining += (e - s);
     else if (nowMin < e) remaining += (e - nowMin);
   });
-  return { totalHours: total / 60, remainingHours: Math.max(remaining / 60, 0) };
+  return { totalHours: total / 60, remainingHours: Math.max(remaining / 60, 0), nowMin, shiftStart, shiftEnd };
 }
-
 const defaultSettings = () => ({
   criticalDays: 0, highDays: 1, mediumDays: 3,
   shiftStart: "10:30", shiftEnd: "20:30",
   breaks: [{ start: "13:30", end: "14:30", label: "Lunch" }, { start: "16:30", end: "17:30", label: "Training" }],
   ownerPasscode: "",
+  fixedSaturdays: [],
+  dutyDefaultCount: 2,
 });
+async function apiLoad(apiUrl) { const res = await fetch(apiUrl, { method: "GET" }); const text = await res.text(); return JSON.parse(text || "{}"); }
+async function apiSave(apiUrl, data) { await fetch(apiUrl, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(data) }); }
 
-async function apiLoad(apiUrl) {
-  const res = await fetch(apiUrl, { method: "GET" });
-  const text = await res.text();
-  return JSON.parse(text || "{}");
-}
-async function apiSave(apiUrl, data) {
-  await fetch(apiUrl, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(data) });
-}
-
-// ---------- time-tracking helpers ----------
-function openEntry(entries, memberId, kind) {
-  return entries.find((e) => e.memberId === memberId && e.kind === kind && !e.endAt);
-}
+function openEntry(entries, memberId, kind) { return entries.find((e) => e.memberId === memberId && e.kind === kind && !e.endAt); }
 function memberDayStatus(entries, memberId) {
   if (openEntry(entries, memberId, "lunch")) return "on_lunch";
-  const task = openEntry(entries, memberId, "task");
-  if (task) return "on_task";
+  if (openEntry(entries, memberId, "task")) return "on_task";
   if (openEntry(entries, memberId, "shift")) return "clocked_in";
   return "clocked_out";
+}
+function accrueLeave(member) {
+  const now = new Date();
+  const curMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  if (!member.leaveLastAccrualMonth) return { ...member, leaveBalance: member.leaveBalance || 0, leaveLastAccrualMonth: curMonth };
+  if (member.leaveLastAccrualMonth === curMonth) return member;
+  let [ly, lm] = member.leaveLastAccrualMonth.split("-").map(Number);
+  let months = 0;
+  while (`${ly}-${String(lm).padStart(2, "0")}` !== curMonth && months < 60) { lm++; if (lm > 12) { lm = 1; ly++; } months++; }
+  return { ...member, leaveBalance: (member.leaveBalance || 0) + months * 6, leaveLastAccrualMonth: curMonth };
+}
+function getUpcomingWeekends(count) {
+  const dates = []; let d = todayStart();
+  while (dates.length < count) { d = new Date(d.getTime() + 86400000); const day = d.getDay(); if (day === 0 || day === 6) dates.push(d.toISOString().slice(0, 10)); }
+  return dates;
+}
+function defaultDutyFor(dateStr, members, defaultCount) {
+  if (!members.length) return [];
+  const weekNum = Math.floor(new Date(dateStr).getTime() / (7 * 86400000));
+  const start = weekNum % members.length;
+  const n = Math.min(defaultCount, members.length);
+  return Array.from({ length: n }, (_, i) => members[(start + i) % members.length].id);
+}
+function dutyFor(dateStr, dutyAssignments, members, defaultCount) {
+  const override = dutyAssignments.find((d) => d.date === dateStr);
+  return override ? override.memberIds : defaultDutyFor(dateStr, members, defaultCount);
 }
 
 function StudioBoard({ apiUrl, onDisconnect }) {
@@ -113,12 +132,18 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   const [projects, setProjects] = useState([]);
   const [settings, setSettings] = useState(defaultSettings());
   const [timeEntries, setTimeEntries] = useState([]);
+  const [leaveRequests, setLeaveRequests] = useState([]);
+  const [dutyAssignments, setDutyAssignments] = useState([]);
+  const [swapRequests, setSwapRequests] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState("");
   const skipNextPush = useRef(false);
 
-  const [session, setSession] = useState(null);
+  const [session, setSession] = useState(() => {
+    try { const s = JSON.parse(localStorage.getItem(SESSION_KEY) || "null"); if (s && s.expiresAt > Date.now()) return s; } catch (e) {}
+    return null;
+  });
   const [tab, setTab] = useState("dashboard");
   const [showSettings, setShowSettings] = useState(false);
   const [now, setNow] = useState(new Date());
@@ -128,15 +153,24 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   const [editForm, setEditForm] = useState({});
   const [expandedLogs, setExpandedLogs] = useState({});
   const [expandedActivity, setExpandedActivity] = useState({});
+  const [showOthers, setShowOthers] = useState(false);
+  const [showOtherProjects, setShowOtherProjects] = useState(false);
+  const [historyFor, setHistoryFor] = useState(null);
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("priority");
+  const [leaveForm, setLeaveForm] = useState({ start: "", end: "", reason: "" });
 
   async function pull() {
     try {
       const data = await apiLoad(apiUrl);
       skipNextPush.current = true;
-      if (data.members) setMembers(data.members);
+      if (data.members) setMembers(data.members.map(accrueLeave));
       if (data.projects) setProjects(data.projects);
       if (data.settings) setSettings({ ...defaultSettings(), ...data.settings });
       if (data.timeEntries) setTimeEntries(data.timeEntries);
+      if (data.leaveRequests) setLeaveRequests(data.leaveRequests);
+      if (data.dutyAssignments) setDutyAssignments(data.dutyAssignments);
+      if (data.swapRequests) setSwapRequests(data.swapRequests);
       setSyncError("");
     } catch (e) { setSyncError("Couldn't reach the sheet."); }
   }
@@ -145,11 +179,18 @@ function StudioBoard({ apiUrl, onDisconnect }) {
     if (!loaded) return;
     if (skipNextPush.current) { skipNextPush.current = false; return; }
     setSyncing(true);
-    const t = setTimeout(() => { apiSave(apiUrl, { members, projects, settings, timeEntries }).finally(() => setSyncing(false)); }, 600);
+    const t = setTimeout(() => { apiSave(apiUrl, { members, projects, settings, timeEntries, leaveRequests, dutyAssignments, swapRequests }).finally(() => setSyncing(false)); }, 600);
     return () => clearTimeout(t);
-  }, [members, projects, settings, timeEntries, loaded]);
-  useEffect(() => { const t = setInterval(() => setNow(new Date()), 30000); return () => clearInterval(t); }, []);
-  useEffect(() => { const t = setInterval(pull, 20000); return () => clearInterval(t); }, []);
+  }, [members, projects, settings, timeEntries, leaveRequests, dutyAssignments, swapRequests, loaded]);
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 15000); return () => clearInterval(t); }, []);
+  useEffect(() => { const t = setInterval(pull, 15000); return () => clearInterval(t); }, []);
+
+  function login(sess) {
+    const withExpiry = { ...sess, expiresAt: Date.now() + SESSION_HOURS * 3600000 };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(withExpiry));
+    setSession(withExpiry);
+  }
+  function logout() { localStorage.removeItem(SESSION_KEY); setSession(null); }
 
   const workClock = useMemo(() => remainingWorkHours(now, settings), [now, settings]);
 
@@ -163,25 +204,24 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   const activeByMember = (memberId) => enriched.filter((p) => p.assignedTo === memberId && p.lifecycle !== "done");
   const todayIdx = dayIndexToday();
 
+  function onApprovedLeaveToday(memberId) {
+    return leaveRequests.some((l) => l.memberId === memberId && l.status === "approved" && dateInRange(todayStr(), l.start, l.end));
+  }
+
   const memberLoad = (m) => {
     const active = activeByMember(m.id);
     const weekCap = m.daily.reduce((a, b) => a + Number(b || 0), 0);
     const weekCommitted = active.reduce((a, p) => a + Number(p.hours || 0), 0);
-    const standardCap = m.daily[todayIdx] || 0;
+    const onLeave = onApprovedLeaveToday(m.id);
+    const standardCap = onLeave ? 0 : (m.daily[todayIdx] || 0);
     const todayCapNow = standardCap > 0 ? Math.round((standardCap / workClock.totalHours) * workClock.remainingHours * 10) / 10 : 0;
     const todayCommitted = active.reduce((a, p) => a + p.pace, 0);
-    return {
-      weekCap, weekAvail: Math.round((weekCap - weekCommitted) * 10) / 10,
-      standardCap, todayCapNow,
-      todayAvail: Math.round((todayCapNow - todayCommitted) * 10) / 10,
-      active,
-    };
+    return { weekCap, weekAvail: Math.round((weekCap - weekCommitted) * 10) / 10, standardCap, todayCapNow, todayCommitted: Math.round(todayCommitted * 10) / 10, todayAvail: Math.round((todayCapNow - todayCommitted) * 10) / 10, active, onLeave };
   };
 
   const isOwner = session?.role === "owner";
   const currentMember = session?.role === "teammate" ? members.find((m) => m.id === session.memberId) : null;
 
-  // ---- project CRUD ----
   function addProject(e) {
     e.preventDefault();
     if (!form.name || !form.hours || !form.deadline) return;
@@ -189,59 +229,85 @@ function StudioBoard({ apiUrl, onDisconnect }) {
     setForm({ name: "", client: "", hours: "", deadline: "", assignedTo: "" });
   }
   function startEdit(p) { setEditingId(p.id); setEditForm({ name: p.name, client: p.client || "", hours: p.hours, deadline: p.deadline }); }
-  function saveEdit(id) {
-    setProjects((ps) => ps.map((p) => p.id === id ? { ...p, name: editForm.name, client: editForm.client, hours: Number(editForm.hours), deadline: editForm.deadline } : p));
-    setEditingId(null);
-  }
+  function saveEdit(id) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, name: editForm.name, client: editForm.client, hours: Number(editForm.hours), deadline: editForm.deadline } : p)); setEditingId(null); }
   function removeProject(id) { setProjects((ps) => ps.filter((p) => p.id !== id)); }
   function toggleDone(id) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, lifecycle: p.lifecycle === "done" ? "active" : "done" } : p)); }
   function reassign(id, memberId) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, assignedTo: memberId || null } : p)); }
   function setProjectStatus(id, status) { setProjects((ps) => ps.map((p) => p.id === id ? { ...p, status } : p)); }
-  function addComment(id, author, text) {
-    if (!text.trim()) return;
-    setProjects((ps) => ps.map((p) => p.id === id ? { ...p, comments: [...(p.comments || []), { author, text, at: nowIso() }] } : p));
-  }
+  function addComment(id, author, text) { if (!text.trim()) return; setProjects((ps) => ps.map((p) => p.id === id ? { ...p, comments: [...(p.comments || []), { author, text, at: nowIso() }] } : p)); }
 
-  // ---- member CRUD ----
   function addMember() {
     if (!newMember.name || !newMember.email) return;
-    setMembers((ms) => [...ms, { id: uid(), name: newMember.name, email: newMember.email, role: newMember.role, daily: [...DEFAULT_DAILY] }]);
+    setMembers((ms) => [...ms, { id: uid(), name: newMember.name, email: newMember.email, role: newMember.role, daily: [...DEFAULT_DAILY], passcode: "", leaveBalance: 0, leaveLastAccrualMonth: `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}` }]);
     setNewMember({ name: "", email: "", role: "" });
   }
   function removeMember(id) { setMembers((ms) => ms.filter((m) => m.id !== id)); }
   function updateMember(id, patch) { setMembers((ms) => ms.map((m) => m.id === id ? { ...m, ...patch } : m)); }
   function updateMemberDay(id, dayIdx, val) { setMembers((ms) => ms.map((m) => m.id === id ? { ...m, daily: m.daily.map((d, i) => i === dayIdx ? Number(val) : d) } : m)); }
 
-  // ---- time tracking actions ----
   function clockIn(memberId) { setTimeEntries((te) => [...te, { id: uid(), memberId, kind: "shift", startAt: nowIso(), endAt: null }]); }
-  function clockOut(memberId) {
-    const t = nowIso();
-    setTimeEntries((te) => te.map((e) => (e.memberId === memberId && !e.endAt) ? { ...e, endAt: t } : e));
+  function clockOut(memberId) { const t = nowIso(); setTimeEntries((te) => te.map((e) => (e.memberId === memberId && !e.endAt) ? { ...e, endAt: t } : e)); }
+  function startLunch(memberId) { const t = nowIso(); setTimeEntries((te) => [...te.map((e) => (e.memberId === memberId && e.kind === "task" && !e.endAt) ? { ...e, endAt: t } : e), { id: uid(), memberId, kind: "lunch", startAt: t, endAt: null }]); }
+  function endLunch(memberId) { const t = nowIso(); setTimeEntries((te) => te.map((e) => (e.memberId === memberId && e.kind === "lunch" && !e.endAt) ? { ...e, endAt: t } : e)); }
+  function startTask(memberId, taskId) { const t = nowIso(); setTimeEntries((te) => [...te.map((e) => (e.memberId === memberId && e.kind === "task" && !e.endAt) ? { ...e, endAt: t } : e), { id: uid(), memberId, kind: "task", taskId, startAt: t, endAt: null }]); }
+
+  function requestLeave(memberId) {
+    if (!leaveForm.start || !leaveForm.end) return;
+    setLeaveRequests((ls) => [...ls, { id: uid(), memberId, start: leaveForm.start, end: leaveForm.end, reason: leaveForm.reason, status: "pending", requestedAt: nowIso() }]);
+    setLeaveForm({ start: "", end: "", reason: "" });
   }
-  function startLunch(memberId) {
-    const t = nowIso();
-    setTimeEntries((te) => [...te.map((e) => (e.memberId === memberId && e.kind === "task" && !e.endAt) ? { ...e, endAt: t } : e), { id: uid(), memberId, kind: "lunch", startAt: t, endAt: null }]);
-  }
-  function endLunch(memberId) {
-    const t = nowIso();
-    setTimeEntries((te) => te.map((e) => (e.memberId === memberId && e.kind === "lunch" && !e.endAt) ? { ...e, endAt: t } : e));
-  }
-  function startTask(memberId, taskId) {
-    const t = nowIso();
-    setTimeEntries((te) => [...te.map((e) => (e.memberId === memberId && e.kind === "task" && !e.endAt) ? { ...e, endAt: t } : e), { id: uid(), memberId, kind: "task", taskId, startAt: t, endAt: null }]);
+  function decideLeave(id, decision) {
+    setLeaveRequests((ls) => ls.map((l) => {
+      if (l.id !== id) return l;
+      if (decision === "approved") {
+        const days = daysBetweenInclusive(l.start, l.end);
+        setMembers((ms) => ms.map((m) => m.id === l.memberId ? { ...m, leaveBalance: (m.leaveBalance || 0) - days } : m));
+      }
+      return { ...l, status: decision };
+    }));
   }
 
-  const sortedProjects = [...enriched].sort((a, b) => {
-    const order = { overdue: 0, critical: 1, high: 2, medium: 3, low: 4 };
-    return order[a.tier] - order[b.tier] || a.daysLeft - b.daysLeft;
-  });
+  function setDuty(date, memberIds) {
+    setDutyAssignments((das) => { const rest = das.filter((d) => d.date !== date); return [...rest, { date, memberIds }]; });
+  }
+  function requestSwap(date, fromMemberId, toMemberId) {
+    setSwapRequests((ss) => [...ss, { id: uid(), date, fromMemberId, toMemberId, status: "pending" }]);
+  }
+  function decideSwap(id, decision) {
+    setSwapRequests((ss) => ss.map((s) => {
+      if (s.id !== id) return s;
+      if (decision === "approved") {
+        const current = dutyFor(s.date, dutyAssignments, members, settings.dutyDefaultCount);
+        const updated = current.map((mid) => mid === s.fromMemberId ? s.toMemberId : mid);
+        setDuty(s.date, updated);
+      }
+      return { ...s, status: decision };
+    }));
+  }
+
+  let sortedProjects = [...enriched];
+  if (search.trim()) { const q = search.toLowerCase(); sortedProjects = sortedProjects.filter((p) => p.name.toLowerCase().includes(q) || (p.client || "").toLowerCase().includes(q)); }
+  const sortFns = {
+    priority: (a, b) => { const o = { overdue: 0, critical: 1, high: 2, medium: 3, low: 4 }; return o[a.tier] - o[b.tier] || a.daysLeft - b.daysLeft; },
+    deadline: (a, b) => a.daysLeft - b.daysLeft,
+    assignee: (a, b) => (members.find((m) => m.id === a.assignedTo)?.name || "zzz").localeCompare(members.find((m) => m.id === b.assignedTo)?.name || "zzz"),
+    status: (a, b) => a.status.localeCompare(b.status),
+  };
+  sortedProjects.sort(sortFns[sortBy]);
+
+  const pendingLeave = leaveRequests.filter((l) => l.status === "pending");
+  const pendingSwaps = swapRequests.filter((s) => s.status === "pending");
+  const needsMeeting = projects.filter((p) => p.status === "needs_meeting" && p.lifecycle !== "done");
+  const ownerAlerts = pendingLeave.length + pendingSwaps.length + needsMeeting.length;
 
   if (!loaded) return <div style={{ padding: 40, color: "#9ca3af" }}>Loading from your sheet…</div>;
-  if (!session) return <LoginScreen members={members} settings={settings} setSettings={setSettings} onLogin={setSession} />;
+  if (!session) return <LoginScreen members={members} settings={settings} setSettings={setSettings} onLogin={login} />;
+
+  const myReminders = currentMember ? getReminders(currentMember, timeEntries, workClock, onApprovedLeaveToday(currentMember.id)) : [];
 
   return (
     <div style={{ maxWidth: 1120, margin: "0 auto", padding: "28px 20px 60px" }}>
-      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24, flexWrap: "wrap", gap: 10 }}>
+      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
         <div>
           <div style={{ fontSize: 12, letterSpacing: "0.14em", textTransform: "uppercase", color: "#6b7280", fontWeight: 600 }}>Studio Ops</div>
           <h1 style={{ fontSize: 26, fontWeight: 800, margin: "2px 0 0", letterSpacing: "-0.02em" }}>Team Board</h1>
@@ -250,10 +316,25 @@ function StudioBoard({ apiUrl, onDisconnect }) {
           <div style={{ fontSize: 12.5, color: "#6b7280" }}>{isOwner ? "Owner" : currentMember?.name} · {workClock.remainingHours.toFixed(1)}h left in shift</div>
           <div style={{ fontSize: 11.5, color: syncError ? "#dc2626" : "#9ca3af" }}>{syncError || (syncing ? "Saving…" : "Synced ✓")}</div>
           {isOwner && <button onClick={() => setShowSettings((s) => !s)} style={btnGhost}>⚙ Rules</button>}
-          <button onClick={() => setSession(null)} style={btnGhost}>Log out</button>
-          <button onClick={onDisconnect} style={btnGhost}>Change sheet</button>
+          <button onClick={logout} style={btnGhost}>Log out</button>
+          {isOwner && <button onClick={onDisconnect} style={btnGhost}>Change sheet</button>}
         </div>
       </header>
+
+      {isOwner && ownerAlerts > 0 && (
+        <div style={{ ...card, marginBottom: 16, background: "#fff7ed", borderColor: "#fed7aa" }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>⚠ {ownerAlerts} item{ownerAlerts > 1 ? "s" : ""} need your attention</div>
+          <div style={{ fontSize: 12.5, color: "#9a3412" }}>
+            {pendingLeave.length > 0 && <span>{pendingLeave.length} leave request{pendingLeave.length > 1 ? "s" : ""} · </span>}
+            {pendingSwaps.length > 0 && <span>{pendingSwaps.length} swap request{pendingSwaps.length > 1 ? "s" : ""} · </span>}
+            {needsMeeting.length > 0 && <span>{needsMeeting.length} project{needsMeeting.length > 1 ? "s" : ""} needing a meeting</span>}
+          </div>
+        </div>
+      )}
+
+      {myReminders.map((r, i) => (
+        <div key={i} style={{ ...card, marginBottom: 12, background: "#fefce8", borderColor: "#fde68a", padding: "10px 16px", fontSize: 13, color: "#92400e" }}>⏰ {r}</div>
+      ))}
 
       {showSettings && isOwner && (
         <div style={{ ...card, marginBottom: 20, background: "#fff" }}>
@@ -263,7 +344,7 @@ function StudioBoard({ apiUrl, onDisconnect }) {
             <SettingField label="High: due within (days)" value={settings.highDays} onChange={(v) => setSettings((s) => ({ ...s, highDays: v }))} />
             <SettingField label="Medium: due within (days)" value={settings.mediumDays} onChange={(v) => setSettings((s) => ({ ...s, mediumDays: v }))} />
           </div>
-          <div style={{ fontWeight: 700, marginBottom: 10 }}>Working hours (real-time)</div>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Working hours</div>
           <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 14 }}>
             <TimeField label="Shift start" value={settings.shiftStart} onChange={(v) => setSettings((s) => ({ ...s, shiftStart: v }))} />
             <TimeField label="Shift end" value={settings.shiftEnd} onChange={(v) => setSettings((s) => ({ ...s, shiftEnd: v }))} />
@@ -274,6 +355,17 @@ function StudioBoard({ apiUrl, onDisconnect }) {
               <TimeField label={`${b.label} end`} value={b.end} onChange={(v) => setSettings((s) => { const bs = [...s.breaks]; bs[i] = { ...bs[i], end: v }; return { ...s, breaks: bs }; })} />
             </div>
           ))}
+          <div style={{ fontWeight: 700, margin: "16px 0 10px" }}>Weekend duty</div>
+          <Field label="Default number assigned per weekend day"><input type="number" min="0" max={members.length} value={settings.dutyDefaultCount} onChange={(e) => setSettings((s) => ({ ...s, dutyDefaultCount: Number(e.target.value) }))} style={{ ...input, width: 90 }} /></Field>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#6b7280", margin: "12px 0 6px" }}>Fixed Saturdays (compulsory for everyone, not part of rotation)</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            {settings.fixedSaturdays.map((d, i) => (
+              <span key={i} style={{ fontSize: 12, background: "#f3f4f6", padding: "4px 10px", borderRadius: 999, display: "flex", alignItems: "center", gap: 6 }}>
+                {d} <button onClick={() => setSettings((s) => ({ ...s, fixedSaturdays: s.fixedSaturdays.filter((x) => x !== d) }))} style={{ border: "none", background: "none", cursor: "pointer", color: "#9ca3af" }}>×</button>
+              </span>
+            ))}
+          </div>
+          <AddDateField onAdd={(d) => setSettings((s) => ({ ...s, fixedSaturdays: [...new Set([...s.fixedSaturdays, d])] }))} />
           <div style={{ borderTop: "1px solid #f1f2f4", marginTop: 16, paddingTop: 14 }}>
             <div style={{ fontWeight: 700, marginBottom: 8, fontSize: 13.5 }}>Owner passcode</div>
             <input type="text" value={settings.ownerPasscode} onChange={(e) => setSettings((s) => ({ ...s, ownerPasscode: e.target.value }))} style={{ ...input, width: 220 }} />
@@ -284,147 +376,50 @@ function StudioBoard({ apiUrl, onDisconnect }) {
       <nav style={{ display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap" }}>
         <TabBtn active={tab === "dashboard"} onClick={() => setTab("dashboard")} label="▦ Dashboard" />
         <TabBtn active={tab === "projects"} onClick={() => setTab("projects")} label="◷ Projects" />
+        <TabBtn active={tab === "schedule"} onClick={() => setTab("schedule")} label="📅 Leave & Duty" />
         {isOwner && <TabBtn active={tab === "team"} onClick={() => setTab("team")} label="◍ Team setup" />}
       </nav>
 
       {tab === "dashboard" && (
         <div>
           {currentMember && (
-            <MyDayPanel member={currentMember} entries={timeEntries} activeProjects={activeByMember(currentMember.id)}
-              onClockIn={() => clockIn(currentMember.id)} onClockOut={() => clockOut(currentMember.id)}
-              onStartLunch={() => startLunch(currentMember.id)} onEndLunch={() => endLunch(currentMember.id)}
-              onStartTask={(tid) => startTask(currentMember.id, tid)} />
+            <>
+              <MyDayPanel member={currentMember} entries={timeEntries} activeProjects={activeByMember(currentMember.id)}
+                onClockIn={() => clockIn(currentMember.id)} onClockOut={() => clockOut(currentMember.id)}
+                onStartLunch={() => startLunch(currentMember.id)} onEndLunch={() => endLunch(currentMember.id)}
+                onStartTask={(tid) => startTask(currentMember.id, tid)} />
+              <MemberCard m={currentMember} load={memberLoad(currentMember)} status={memberDayStatus(timeEntries, currentMember.id)}
+                highlight todaysEntries={timeEntries.filter((e) => e.memberId === currentMember.id && isToday(e.startAt))}
+                projects={projects} expandedActivity={expandedActivity} setExpandedActivity={setExpandedActivity} big />
+              {members.length > 1 && (
+                <button onClick={() => setShowOthers((s) => !s)} style={{ ...btnGhost, margin: "16px 0" }}>{showOthers ? "Hide other team members" : `Show other team members (${members.length - 1})`}</button>
+              )}
+            </>
           )}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
-            {members.map((m) => {
-              const load = memberLoad(m);
-              const status = memberDayStatus(timeEntries, m.id);
-              const todaysEntries = timeEntries.filter((e) => e.memberId === m.id && isToday(e.startAt));
-              const showActivity = expandedActivity[m.id];
-              return (
-                <div key={m.id} style={{ ...card, ...(currentMember?.id === m.id ? { borderColor: "#c7d2fe", boxShadow: "0 0 0 2px #eef2ff" } : {}) }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-                    <div style={{ fontWeight: 700, fontSize: 16 }}>{m.name}</div>
-                    <StatusBadge status={status} />
-                  </div>
-                  {m.role && <div style={{ fontSize: 12, color: "#9ca3af", marginBottom: 8 }}>{m.role}</div>}
-                  <div style={{ display: "flex", gap: 10, margin: "14px 0" }}>
-                    <StatBlock label="Available right now" value={`${load.todayAvail}h`} sub={`of ${load.todayCapNow}h left in shift`} warn={load.todayAvail < 0} />
-                    <StatBlock label="This week available" value={`${load.weekAvail}h`} sub={`of ${load.weekCap}h`} warn={load.weekAvail < 0} />
-                  </div>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>ASSIGNED PROJECTS</div>
-                  {load.active.length === 0 && <div style={{ fontSize: 13, color: "#9ca3af", marginBottom: 10 }}>Nothing assigned.</div>}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
-                    {load.active.sort((a, b) => a.daysLeft - b.daysLeft).map((p) => {
-                      const t = tierInfo(p.tier); const st = STATUS[p.status] || STATUS.on_track;
-                      return (
-                        <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, padding: "6px 8px", borderRadius: 8, background: "#fafafa", gap: 6 }}>
-                          <span style={{ fontWeight: 600 }}>{p.name}</span>
-                          <span style={{ display: "flex", gap: 6, alignItems: "center", color: "#6b7280", flexWrap: "wrap", justifyContent: "flex-end" }}>
-                            {p.daysLeft < 0 ? "overdue" : p.daysLeft === 0 ? "today" : `${p.daysLeft}d left`}
-                            <Chip tier={t} /><span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 999, color: st.color, background: st.bg }}>{st.label}</span>
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <button onClick={() => setExpandedActivity((s) => ({ ...s, [m.id]: !s[m.id] }))} style={{ ...btnGhost, fontSize: 11.5, padding: "5px 10px" }}>
-                    {showActivity ? "Hide today's activity" : `Show today's activity (${todaysEntries.length})`}
-                  </button>
-                  {showActivity && <ActivityLog entries={todaysEntries} projects={projects} />}
-                </div>
-              );
-            })}
-            {members.length === 0 && <div style={{ ...card, color: "#9ca3af" }}>No team members yet.</div>}
-          </div>
+          {(isOwner || showOthers) && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
+              {members.filter((m) => m.id !== currentMember?.id).map((m) => (
+                <MemberCard key={m.id} m={m} load={memberLoad(m)} status={memberDayStatus(timeEntries, m.id)}
+                  todaysEntries={timeEntries.filter((e) => e.memberId === m.id && isToday(e.startAt))}
+                  projects={projects} expandedActivity={expandedActivity} setExpandedActivity={setExpandedActivity}
+                  onHistory={isOwner ? () => setHistoryFor(m.id) : null} />
+              ))}
+              {members.length === 0 && <div style={{ ...card, color: "#9ca3af" }}>No team members yet.</div>}
+            </div>
+          )}
+          {historyFor && <MemberHistory member={members.find((m) => m.id === historyFor)} projects={projects} timeEntries={timeEntries} onClose={() => setHistoryFor(null)} />}
         </div>
       )}
 
       {tab === "projects" && (
-        <div>
-          {isOwner && (
-            <form onSubmit={addProject} style={{ ...card, marginBottom: 18, display: "grid", gridTemplateColumns: "1.4fr 1fr 0.7fr 0.9fr 1fr auto", gap: 10, alignItems: "end" }}>
-              <Field label="Project name"><input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} style={input} placeholder="Brand shoot v2" /></Field>
-              <Field label="Client (optional)"><input value={form.client} onChange={(e) => setForm((f) => ({ ...f, client: e.target.value }))} style={input} placeholder="Acme Co." /></Field>
-              <Field label="Hours needed"><input type="number" min="0" step="0.5" value={form.hours} onChange={(e) => setForm((f) => ({ ...f, hours: e.target.value }))} style={input} placeholder="12" /></Field>
-              <Field label="Deadline"><input type="date" value={form.deadline} onChange={(e) => setForm((f) => ({ ...f, deadline: e.target.value }))} style={input} /></Field>
-              <Field label="Assign to">
-                <select value={form.assignedTo} onChange={(e) => setForm((f) => ({ ...f, assignedTo: e.target.value }))} style={input}>
-                  <option value="">Unassigned</option>
-                  {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
-                </select>
-              </Field>
-              <button type="submit" style={btnPrimary}>+ Add</button>
-            </form>
-          )}
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {sortedProjects.length === 0 && <div style={{ ...card, color: "#9ca3af", textAlign: "center" }}>No projects yet.</div>}
-            {sortedProjects.map((p) => {
-              const t = tierInfo(p.tier);
-              const canEditStatus = isOwner || currentMember?.id === p.assignedTo;
-              const comments = p.comments || [];
-              const expanded = expandedLogs[p.id];
-              const isEditing = editingId === p.id;
-              return (
-                <div key={p.id} style={{ ...card, opacity: p.lifecycle === "done" ? 0.55 : 1 }}>
-                  {isEditing ? (
-                    <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 0.7fr 0.9fr auto auto", gap: 10, alignItems: "end" }}>
-                      <Field label="Project name"><input value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} style={input} /></Field>
-                      <Field label="Client"><input value={editForm.client} onChange={(e) => setEditForm((f) => ({ ...f, client: e.target.value }))} style={input} /></Field>
-                      <Field label="Hours"><input type="number" min="0" step="0.5" value={editForm.hours} onChange={(e) => setEditForm((f) => ({ ...f, hours: e.target.value }))} style={input} /></Field>
-                      <Field label="Deadline"><input type="date" value={editForm.deadline} onChange={(e) => setEditForm((f) => ({ ...f, deadline: e.target.value }))} style={input} /></Field>
-                      <button onClick={() => saveEdit(p.id)} style={btnPrimary}>Save</button>
-                      <button onClick={() => setEditingId(null)} style={btnGhost}>Cancel</button>
-                    </div>
-                  ) : (
-                    <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-                      {isOwner && <button onClick={() => toggleDone(p.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: p.lifecycle === "done" ? "#16a34a" : "#d1d5db" }}>{p.lifecycle === "done" ? "✓" : "○"}</button>}
-                      <div style={{ width: 78 }}><Chip tier={t} big /></div>
-                      <div style={{ flex: 1, minWidth: 180 }}>
-                        <div style={{ fontWeight: 700, textDecoration: p.lifecycle === "done" ? "line-through" : "none" }}>{p.name}</div>
-                        <div style={{ fontSize: 12.5, color: "#9ca3af" }}>{p.client && `${p.client} · `}{p.hours}h needed · {p.pace.toFixed(1)}h/day pace · {p.daysLeft < 0 ? `${-p.daysLeft}d overdue` : p.daysLeft === 0 ? "due today" : `due in ${p.daysLeft}d`} · {members.find((m) => m.id === p.assignedTo)?.name || "Unassigned"}</div>
-                      </div>
-                      {canEditStatus && (
-                        <select value={p.status} onChange={(e) => setProjectStatus(p.id, e.target.value)} style={{ ...input, width: 150 }}>
-                          {Object.entries(STATUS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-                        </select>
-                      )}
-                      {isOwner && (
-                        <select value={p.assignedTo || ""} onChange={(e) => reassign(p.id, e.target.value)} style={{ ...input, width: 150 }}>
-                          <option value="">Unassigned</option>
-                          {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
-                        </select>
-                      )}
-                      {isOwner && <button onClick={() => startEdit(p)} style={btnGhost}>Edit</button>}
-                      {isOwner && <button onClick={() => removeProject(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", fontSize: 16 }}>🗑</button>}
-                    </div>
-                  )}
+        <ProjectsTab {...{ isOwner, currentMember, members, form, setForm, addProject, sortedProjects, search, setSearch, sortBy, setSortBy,
+          editingId, editForm, setEditForm, startEdit, saveEdit, setEditingId, toggleDone, removeProject, reassign, setProjectStatus,
+          expandedLogs, setExpandedLogs, addComment, showOtherProjects, setShowOtherProjects }} />
+      )}
 
-                  <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f2f4" }}>
-                    {comments.length > 0 && (
-                      <div style={{ fontSize: 12.5, color: "#4b5563", marginBottom: 6 }}>
-                        <strong>{comments[comments.length - 1].author}</strong> · <span style={{ color: "#9ca3af" }}>{fmtTime(comments[comments.length - 1].at)}</span> — {comments[comments.length - 1].text}
-                      </div>
-                    )}
-                    {comments.length > 1 && (
-                      <button onClick={() => setExpandedLogs((s) => ({ ...s, [p.id]: !s[p.id] }))} style={{ ...btnGhost, fontSize: 11, padding: "4px 9px", marginBottom: 8 }}>
-                        {expanded ? "Hide history" : `Show full history (${comments.length})`}
-                      </button>
-                    )}
-                    {expanded && (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 8, background: "#fafafa", padding: 10, borderRadius: 8 }}>
-                        {comments.slice(0, -1).reverse().map((c, i) => (
-                          <div key={i} style={{ fontSize: 12, color: "#6b7280" }}><strong>{c.author}</strong> · {fmtTime(c.at)} — {c.text}</div>
-                        ))}
-                      </div>
-                    )}
-                    <CommentBox onAdd={(text) => addComment(p.id, isOwner ? "Owner" : currentMember?.name, text)} />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+      {tab === "schedule" && (
+        <ScheduleTab {...{ isOwner, currentMember, members, leaveRequests, requestLeave, decideLeave, leaveForm, setLeaveForm,
+          dutyAssignments, swapRequests, requestSwap, decideSwap, setDuty, settings }} />
       )}
 
       {tab === "team" && isOwner && (
@@ -432,7 +427,7 @@ function StudioBoard({ apiUrl, onDisconnect }) {
           <div style={{ ...card, marginBottom: 16, display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 10, alignItems: "end" }}>
             <Field label="Name"><input value={newMember.name} onChange={(e) => setNewMember((f) => ({ ...f, name: e.target.value }))} style={input} /></Field>
             <Field label="Email"><input type="email" value={newMember.email} onChange={(e) => setNewMember((f) => ({ ...f, email: e.target.value }))} style={input} /></Field>
-            <Field label="Role (optional)"><input value={newMember.role} onChange={(e) => setNewMember((f) => ({ ...f, role: e.target.value }))} style={input} placeholder="Editor, Designer, Manager..." /></Field>
+            <Field label="Role (optional)"><input value={newMember.role} onChange={(e) => setNewMember((f) => ({ ...f, role: e.target.value }))} style={input} placeholder="Editor, Designer..." /></Field>
             <button onClick={addMember} style={btnPrimary}>+ Add teammate</button>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
@@ -445,10 +440,13 @@ function StudioBoard({ apiUrl, onDisconnect }) {
                     <Field label="Email"><input value={m.email} onChange={(e) => updateMember(m.id, { email: e.target.value })} style={input} /></Field>
                     <div style={{ height: 10 }} />
                     <Field label="Role"><input value={m.role} onChange={(e) => updateMember(m.id, { role: e.target.value })} style={input} /></Field>
+                    <div style={{ height: 10 }} />
+                    <Field label="Passcode"><input value={m.passcode || ""} onChange={(e) => updateMember(m.id, { passcode: e.target.value })} style={input} placeholder="Set a login passcode" /></Field>
                   </div>
                   <button onClick={() => removeMember(m.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", marginLeft: 8, fontSize: 15 }}>🗑</button>
                 </div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", margin: "16px 0 8px" }}>STANDARD DAILY CAPACITY (hours)</div>
+                <div style={{ fontSize: 12.5, color: "#6b7280", margin: "10px 0" }}>Leave balance: <strong style={{ color: "#1c1f26" }}>{m.leaveBalance ?? 0} days</strong></div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", margin: "10px 0 8px" }}>STANDARD DAILY CAPACITY (hours)</div>
                 <div style={{ display: "flex", gap: 6 }}>
                   {DAY_LABELS.map((d, i) => (
                     <div key={d} style={{ flex: 1, textAlign: "center" }}>
@@ -466,21 +464,319 @@ function StudioBoard({ apiUrl, onDisconnect }) {
   );
 }
 
-// ---------- My Day (clock in/out panel) ----------
+function getReminders(member, entries, workClock, onLeave) {
+  if (onLeave) return [];
+  const status = memberDayStatus(entries, member.id);
+  const msgs = [];
+  const { nowMin, shiftStart, shiftEnd } = workClock;
+  if (status === "clocked_out" && nowMin > shiftStart + 15 && nowMin < shiftEnd) msgs.push("You haven't clocked in yet today.");
+  if (status !== "clocked_out" && nowMin > shiftEnd) msgs.push("Your shift ended — don't forget to clock out.");
+  return msgs;
+}
+
+function ProjectsTab({ isOwner, currentMember, members, form, setForm, addProject, sortedProjects, search, setSearch, sortBy, setSortBy, editingId, editForm, setEditForm, startEdit, saveEdit, setEditingId, toggleDone, removeProject, reassign, setProjectStatus, expandedLogs, setExpandedLogs, addComment, showOtherProjects, setShowOtherProjects }) {
+  const mine = currentMember ? sortedProjects.filter((p) => p.assignedTo === currentMember.id) : [];
+  const others = currentMember ? sortedProjects.filter((p) => p.assignedTo !== currentMember.id) : sortedProjects;
+
+  return (
+    <div>
+      {isOwner && (
+        <>
+          <form onSubmit={addProject} style={{ ...card, marginBottom: 12, display: "grid", gridTemplateColumns: "1.4fr 1fr 0.7fr 0.9fr 1fr auto", gap: 10, alignItems: "end" }}>
+            <Field label="Project name"><input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} style={input} placeholder="Brand shoot v2" /></Field>
+            <Field label="Client (optional)"><input value={form.client} onChange={(e) => setForm((f) => ({ ...f, client: e.target.value }))} style={input} placeholder="Acme Co." /></Field>
+            <Field label="Hours needed"><input type="number" min="0" step="0.5" value={form.hours} onChange={(e) => setForm((f) => ({ ...f, hours: e.target.value }))} style={input} placeholder="12" /></Field>
+            <Field label="Deadline"><input type="date" value={form.deadline} onChange={(e) => setForm((f) => ({ ...f, deadline: e.target.value }))} style={input} /></Field>
+            <Field label="Assign to">
+              <select value={form.assignedTo} onChange={(e) => setForm((f) => ({ ...f, assignedTo: e.target.value }))} style={input}>
+                <option value="">Unassigned</option>
+                {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </Field>
+            <button type="submit" style={btnPrimary}>+ Add</button>
+          </form>
+          <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by project or client…" style={{ ...input, maxWidth: 280 }} />
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={{ ...input, maxWidth: 200 }}>
+              <option value="priority">Sort: Priority</option>
+              <option value="deadline">Sort: Deadline</option>
+              <option value="assignee">Sort: Assignee</option>
+              <option value="status">Sort: Status</option>
+            </select>
+          </div>
+        </>
+      )}
+
+      {currentMember && (
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#6b7280", marginBottom: 8 }}>MY PROJECTS</div>
+      )}
+      <ProjectList {...{ list: currentMember ? mine : sortedProjects, isOwner, currentMember, members, editingId, editForm, setEditForm, startEdit, saveEdit, setEditingId, toggleDone, removeProject, reassign, setProjectStatus, expandedLogs, setExpandedLogs, addComment }} />
+
+      {currentMember && others.length > 0 && (
+        <>
+          <button onClick={() => setShowOtherProjects((s) => !s)} style={{ ...btnGhost, margin: "16px 0" }}>{showOtherProjects ? "Hide team projects" : `Show team projects (${others.length})`}</button>
+          {showOtherProjects && (
+            <>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#6b7280", marginBottom: 8 }}>TEAM PROJECTS</div>
+              <ProjectList {...{ list: others, isOwner, currentMember, members, editingId, editForm, setEditForm, startEdit, saveEdit, setEditingId, toggleDone, removeProject, reassign, setProjectStatus, expandedLogs, setExpandedLogs, addComment, readOnly: true }} />
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ProjectList({ list, isOwner, currentMember, members, editingId, editForm, setEditForm, startEdit, saveEdit, setEditingId, toggleDone, removeProject, reassign, setProjectStatus, expandedLogs, setExpandedLogs, addComment, readOnly }) {
+  if (list.length === 0) return <div style={{ ...card, color: "#9ca3af", textAlign: "center", marginBottom: 16 }}>No projects here.</div>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+      {list.map((p) => {
+        const t = tierInfo(p.tier);
+        const canEditStatus = !readOnly && (isOwner || currentMember?.id === p.assignedTo);
+        const comments = p.comments || [];
+        const expanded = expandedLogs[p.id];
+        const isEditing = editingId === p.id;
+        return (
+          <div key={p.id} style={{ ...card, opacity: p.lifecycle === "done" ? 0.55 : 1 }}>
+            {isEditing ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 0.7fr 0.9fr auto auto", gap: 10, alignItems: "end" }}>
+                <Field label="Project name"><input value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} style={input} /></Field>
+                <Field label="Client"><input value={editForm.client} onChange={(e) => setEditForm((f) => ({ ...f, client: e.target.value }))} style={input} /></Field>
+                <Field label="Hours"><input type="number" min="0" step="0.5" value={editForm.hours} onChange={(e) => setEditForm((f) => ({ ...f, hours: e.target.value }))} style={input} /></Field>
+                <Field label="Deadline"><input type="date" value={editForm.deadline} onChange={(e) => setEditForm((f) => ({ ...f, deadline: e.target.value }))} style={input} /></Field>
+                <button onClick={() => saveEdit(p.id)} style={btnPrimary}>Save</button>
+                <button onClick={() => setEditingId(null)} style={btnGhost}>Cancel</button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                {isOwner && !readOnly && <button onClick={() => toggleDone(p.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: p.lifecycle === "done" ? "#16a34a" : "#d1d5db" }}>{p.lifecycle === "done" ? "✓" : "○"}</button>}
+                <div style={{ width: 78 }}><Chip tier={t} big /></div>
+                <div style={{ flex: 1, minWidth: 180 }}>
+                  <div style={{ fontWeight: 700, textDecoration: p.lifecycle === "done" ? "line-through" : "none" }}>{p.name}</div>
+                  <div style={{ fontSize: 12.5, color: "#9ca3af" }}>{p.client && `${p.client} · `}{p.hours}h needed · {p.pace.toFixed(1)}h/day pace · {p.daysLeft < 0 ? `${-p.daysLeft}d overdue` : p.daysLeft === 0 ? "due today" : `due in ${p.daysLeft}d`} · {members.find((m) => m.id === p.assignedTo)?.name || "Unassigned"}</div>
+                </div>
+                {canEditStatus && (
+                  <select value={p.status} onChange={(e) => setProjectStatus(p.id, e.target.value)} style={{ ...input, width: 150 }}>
+                    {Object.entries(STATUS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                  </select>
+                )}
+                {!canEditStatus && <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 999, color: STATUS[p.status].color, background: STATUS[p.status].bg }}>{STATUS[p.status].label}</span>}
+                {isOwner && !readOnly && (
+                  <select value={p.assignedTo || ""} onChange={(e) => reassign(p.id, e.target.value)} style={{ ...input, width: 150 }}>
+                    <option value="">Unassigned</option>
+                    {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                  </select>
+                )}
+                {isOwner && !readOnly && <button onClick={() => startEdit(p)} style={btnGhost}>Edit</button>}
+                {isOwner && !readOnly && <button onClick={() => removeProject(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#d1d5db", fontSize: 16 }}>🗑</button>}
+              </div>
+            )}
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f2f4" }}>
+              {comments.length > 0 && (
+                <div style={{ fontSize: 12.5, color: "#4b5563", marginBottom: 6 }}>
+                  <strong>{comments[comments.length - 1].author}</strong> · <span style={{ color: "#9ca3af" }}>{fmtTime(comments[comments.length - 1].at)}</span> — {comments[comments.length - 1].text}
+                </div>
+              )}
+              {comments.length > 1 && (
+                <button onClick={() => setExpandedLogs((s) => ({ ...s, [p.id]: !s[p.id] }))} style={{ ...btnGhost, fontSize: 11, padding: "4px 9px", marginBottom: 8 }}>{expanded ? "Hide history" : `Show full history (${comments.length})`}</button>
+              )}
+              {expanded && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 8, background: "#fafafa", padding: 10, borderRadius: 8 }}>
+                  {comments.slice(0, -1).reverse().map((c, i) => (<div key={i} style={{ fontSize: 12, color: "#6b7280" }}><strong>{c.author}</strong> · {fmtTime(c.at)} — {c.text}</div>))}
+                </div>
+              )}
+              {!readOnly && <CommentBox onAdd={(text) => addComment(p.id, isOwner ? "Owner" : currentMember?.name, text)} />}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ScheduleTab({ isOwner, currentMember, members, leaveRequests, requestLeave, decideLeave, leaveForm, setLeaveForm, dutyAssignments, swapRequests, requestSwap, decideSwap, setDuty, settings }) {
+  const weekends = getUpcomingWeekends(8);
+  const [swapPick, setSwapPick] = useState({});
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 16, marginBottom: 20 }}>
+        {currentMember && (
+          <div style={card}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>Request leave</div>
+            <div style={{ fontSize: 12.5, color: "#6b7280", marginBottom: 12 }}>Balance: <strong style={{ color: "#1c1f26" }}>{currentMember.leaveBalance ?? 0} days</strong></div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+              <input type="date" value={leaveForm.start} onChange={(e) => setLeaveForm((f) => ({ ...f, start: e.target.value }))} style={{ ...input, width: 140 }} />
+              <input type="date" value={leaveForm.end} onChange={(e) => setLeaveForm((f) => ({ ...f, end: e.target.value }))} style={{ ...input, width: 140 }} />
+            </div>
+            <input value={leaveForm.reason} onChange={(e) => setLeaveForm((f) => ({ ...f, reason: e.target.value }))} placeholder="Reason (optional)" style={{ ...input, marginBottom: 8 }} />
+            <button onClick={() => requestLeave(currentMember.id)} style={btnPrimary}>Submit request</button>
+            <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 6 }}>
+              {leaveRequests.filter((l) => l.memberId === currentMember.id).slice().reverse().map((l) => (
+                <div key={l.id} style={{ fontSize: 12.5, color: "#4b5563" }}>{l.start} → {l.end} <LeaveStatusChip status={l.status} /></div>
+              ))}
+            </div>
+          </div>
+        )}
+        {isOwner && (
+          <div style={card}>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>Leave requests</div>
+            {leaveRequests.filter((l) => l.status === "pending").length === 0 && <div style={{ fontSize: 13, color: "#9ca3af" }}>No pending requests.</div>}
+            {leaveRequests.filter((l) => l.status === "pending").map((l) => (
+              <div key={l.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #f1f2f4", fontSize: 13 }}>
+                <span>{members.find((m) => m.id === l.memberId)?.name} · {l.start} → {l.end}{l.reason && ` · ${l.reason}`}</span>
+                <span style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => decideLeave(l.id, "approved")} style={{ ...btnGhost, color: "#16a34a", padding: "4px 10px" }}>Approve</button>
+                  <button onClick={() => decideLeave(l.id, "rejected")} style={{ ...btnGhost, color: "#dc2626", padding: "4px 10px" }}>Reject</button>
+                </span>
+              </div>
+            ))}
+            <div style={{ fontWeight: 700, margin: "16px 0 8px" }}>Team leave balances</div>
+            {members.map((m) => <div key={m.id} style={{ fontSize: 12.5, color: "#4b5563", marginBottom: 3 }}>{m.name}: <strong>{m.leaveBalance ?? 0} days</strong></div>)}
+          </div>
+        )}
+        {isOwner && (
+          <div style={card}>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>Swap requests</div>
+            {swapRequests.filter((s) => s.status === "pending").length === 0 && <div style={{ fontSize: 13, color: "#9ca3af" }}>None pending.</div>}
+            {swapRequests.filter((s) => s.status === "pending").map((s) => (
+              <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #f1f2f4", fontSize: 13 }}>
+                <span>{s.date}: {members.find((m) => m.id === s.fromMemberId)?.name} → {members.find((m) => m.id === s.toMemberId)?.name}</span>
+                <span style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => decideSwap(s.id, "approved")} style={{ ...btnGhost, color: "#16a34a", padding: "4px 10px" }}>Approve</button>
+                  <button onClick={() => decideSwap(s.id, "rejected")} style={{ ...btnGhost, color: "#dc2626", padding: "4px 10px" }}>Reject</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={card}>
+        <div style={{ fontWeight: 700, marginBottom: 4 }}>Weekend duty rotation</div>
+        <p style={{ fontSize: 12.5, color: "#6b7280", marginBottom: 14 }}>Fixed Saturdays are compulsory for everyone. Other weekend days rotate — default {settings.dutyDefaultCount} people, owner-editable.</p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {weekends.map((date) => {
+            const isFixed = settings.fixedSaturdays.includes(date);
+            const assigned = isFixed ? members.map((m) => m.id) : dutyFor(date, dutyAssignments, members, settings.dutyDefaultCount);
+            const dayName = new Date(date + "T00:00:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+            const amOn = currentMember && assigned.includes(currentMember.id);
+            return (
+              <div key={date} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", borderRadius: 8, background: isFixed ? "#fef3c7" : "#fafafa", gap: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 13, fontWeight: 600, minWidth: 140 }}>{dayName}{isFixed && " · Fixed (all)"}</span>
+                {isOwner && !isFixed ? (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {members.map((m) => (
+                      <label key={m.id} style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}>
+                        <input type="checkbox" checked={assigned.includes(m.id)} onChange={(e) => {
+                          const next = e.target.checked ? [...assigned, m.id] : assigned.filter((x) => x !== m.id);
+                          setDuty(date, next);
+                        }} /> {m.name}
+                      </label>
+                    ))}
+                  </div>
+                ) : (
+                  <span style={{ fontSize: 12.5, color: "#4b5563" }}>{assigned.map((id) => members.find((m) => m.id === id)?.name).filter(Boolean).join(", ") || "Unassigned"}</span>
+                )}
+                {amOn && !isFixed && (
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <select value={swapPick[date] || ""} onChange={(e) => setSwapPick((s) => ({ ...s, [date]: e.target.value }))} style={{ ...input, width: 130, fontSize: 12 }}>
+                      <option value="">Swap with…</option>
+                      {members.filter((m) => m.id !== currentMember.id).map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    </select>
+                    <button disabled={!swapPick[date]} onClick={() => { requestSwap(date, currentMember.id, swapPick[date]); setSwapPick((s) => ({ ...s, [date]: "" })); }} style={{ ...btnGhost, fontSize: 11.5, padding: "4px 8px" }}>Request</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LeaveStatusChip({ status }) {
+  const map = { pending: { c: "#9a3412", b: "#ffedd5" }, approved: { c: "#166534", b: "#dcfce7" }, rejected: { c: "#991b1b", b: "#fee2e2" } };
+  const s = map[status];
+  return <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 999, color: s.c, background: s.b, marginLeft: 6 }}>{status}</span>;
+}
+
+function MemberCard({ m, load, status, todaysEntries, projects, expandedActivity, setExpandedActivity, highlight, big, onHistory }) {
+  const showActivity = expandedActivity[m.id];
+  return (
+    <div style={{ ...card, marginBottom: big ? 16 : 0, ...(highlight ? { borderColor: "#c7d2fe", boxShadow: "0 0 0 2px #eef2ff" } : {}) }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+        <div style={{ fontWeight: 700, fontSize: 16 }}>{m.name}</div>
+        <StatusBadge status={load.onLeave ? "on_leave" : status} />
+      </div>
+      {m.role && <div style={{ fontSize: 12, color: "#9ca3af", marginBottom: 8 }}>{m.role}</div>}
+      <div style={{ display: "flex", gap: 10, margin: "14px 0" }}>
+        <StatBlock label="Available right now" value={`${load.todayAvail}h`} sub={`of ${load.todayCapNow}h left in shift`} warn={load.todayAvail < 0} />
+        <StatBlock label="This week available" value={`${load.weekAvail}h`} sub={`of ${load.weekCap}h`} warn={load.weekAvail < 0} />
+      </div>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>ASSIGNED PROJECTS</div>
+      {load.active.length === 0 && <div style={{ fontSize: 13, color: "#9ca3af", marginBottom: 10 }}>Nothing assigned.</div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+        {load.active.sort((a, b) => a.daysLeft - b.daysLeft).map((p) => {
+          const t = tierInfo(p.tier); const st = STATUS[p.status] || STATUS.on_track;
+          return (
+            <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 13, padding: "6px 8px", borderRadius: 8, background: "#fafafa", gap: 6 }}>
+              <span style={{ fontWeight: 600 }}>{p.name}</span>
+              <span style={{ display: "flex", gap: 6, alignItems: "center", color: "#6b7280", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                {p.daysLeft < 0 ? "overdue" : p.daysLeft === 0 ? "today" : `${p.daysLeft}d left`}
+                <Chip tier={t} /><span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 999, color: st.color, background: st.bg }}>{st.label}</span>
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={() => setExpandedActivity((s) => ({ ...s, [m.id]: !s[m.id] }))} style={{ ...btnGhost, fontSize: 11.5, padding: "5px 10px" }}>{showActivity ? "Hide today's activity" : `Show today's activity (${todaysEntries.length})`}</button>
+        {onHistory && <button onClick={onHistory} style={{ ...btnGhost, fontSize: 11.5, padding: "5px 10px" }}>Full history</button>}
+      </div>
+      {showActivity && <ActivityLog entries={todaysEntries} projects={projects} />}
+    </div>
+  );
+}
+
+function MemberHistory({ member, projects, timeEntries, onClose }) {
+  const myComments = projects.flatMap((p) => (p.comments || []).filter((c) => c.author === member.name).map((c) => ({ ...c, project: p.name })));
+  const myEntries = timeEntries.filter((e) => e.memberId === member.id).sort((a, b) => new Date(b.startAt) - new Date(a.startAt));
+  return (
+    <div style={{ ...card, marginTop: 16, background: "#fff" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontWeight: 700 }}>{member.name} — full history</div>
+        <button onClick={onClose} style={btnGhost}>Close</button>
+      </div>
+      <div style={{ fontSize: 12.5, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>PROGRESS LOG</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 16, maxHeight: 200, overflowY: "auto" }}>
+        {myComments.length === 0 && <div style={{ fontSize: 12.5, color: "#9ca3af" }}>No log entries yet.</div>}
+        {myComments.slice().reverse().map((c, i) => (<div key={i} style={{ fontSize: 12.5, color: "#4b5563" }}>{fmtDate(c.at)} {fmtTime(c.at)} — <strong>{c.project}</strong>: {c.text}</div>))}
+      </div>
+      <div style={{ fontSize: 12.5, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>TIME LOG</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 220, overflowY: "auto" }}>
+        {myEntries.length === 0 && <div style={{ fontSize: 12.5, color: "#9ca3af" }}>No time entries yet.</div>}
+        {myEntries.map((e) => {
+          const label = e.kind === "shift" ? "Shift" : e.kind === "lunch" ? "Lunch" : (projects.find((p) => p.id === e.taskId)?.name || "Task");
+          return <div key={e.id} style={{ fontSize: 12, color: "#6b7280" }}>{fmtDate(e.startAt)} — {label}: {fmtTime(e.startAt)}–{e.endAt ? fmtTime(e.endAt) : "ongoing"}</div>;
+        })}
+      </div>
+    </div>
+  );
+}
+
 function MyDayPanel({ member, entries, activeProjects, onClockIn, onClockOut, onStartLunch, onEndLunch, onStartTask }) {
   const status = memberDayStatus(entries, member.id);
   const activeTaskEntry = openEntry(entries, member.id, "task");
   const activeProject = activeTaskEntry && activeProjects.find((p) => p.id === activeTaskEntry.taskId);
   const [pickedTask, setPickedTask] = useState("");
-
   return (
     <div style={{ ...card, marginBottom: 16, background: "#eef2ff", borderColor: "#c7d2fe" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
         <div>
           <div style={{ fontWeight: 700, fontSize: 14 }}>My Day</div>
-          <div style={{ fontSize: 12.5, color: "#4b5563" }}>
-            <StatusBadge status={status} /> {activeProject && <span> — working on <strong>{activeProject.name}</strong></span>}
-          </div>
+          <div style={{ fontSize: 12.5, color: "#4b5563" }}><StatusBadge status={status} /> {activeProject && <span> — working on <strong>{activeProject.name}</strong></span>}</div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           {status === "clocked_out" && <button onClick={onClockIn} style={btnPrimary}>Clock in</button>}
@@ -508,11 +804,11 @@ function StatusBadge({ status }) {
     clocked_in: { label: "Clocked in", color: "#166534", bg: "#dcfce7" },
     on_lunch: { label: "On lunch", color: "#9a3412", bg: "#ffedd5" },
     on_task: { label: "Working", color: "#1e3a8a", bg: "#dbeafe" },
+    on_leave: { label: "On leave", color: "#7c2d12", bg: "#fef2f2" },
   };
   const s = map[status] || map.clocked_out;
   return <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 999, color: s.color, background: s.bg }}>{s.label}</span>;
 }
-
 function ActivityLog({ entries, projects }) {
   const sorted = [...entries].sort((a, b) => new Date(a.startAt) - new Date(b.startAt));
   if (sorted.length === 0) return <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 8 }}>No activity logged today.</div>;
@@ -522,24 +818,18 @@ function ActivityLog({ entries, projects }) {
         const label = e.kind === "shift" ? "Shift" : e.kind === "lunch" ? "Lunch" : (projects.find((p) => p.id === e.taskId)?.name || "Task");
         const endLabel = e.endAt ? fmtTime(e.endAt) : "now";
         const mins = ((e.endAt ? new Date(e.endAt) : new Date()) - new Date(e.startAt)) / 60000;
-        return (
-          <div key={e.id} style={{ fontSize: 11.5, color: "#6b7280", display: "flex", justifyContent: "space-between", background: "#fafafa", padding: "4px 8px", borderRadius: 6 }}>
-            <span>{label}</span><span>{fmtTime(e.startAt)}–{endLabel} ({fmtDur(mins)})</span>
-          </div>
-        );
+        return (<div key={e.id} style={{ fontSize: 11.5, color: "#6b7280", display: "flex", justifyContent: "space-between", background: "#fafafa", padding: "4px 8px", borderRadius: 6 }}><span>{label}</span><span>{fmtTime(e.startAt)}–{endLabel} ({fmtDur(mins)})</span></div>);
       })}
     </div>
   );
 }
-
 function CommentBox({ onAdd }) {
   const [text, setText] = useState("");
-  return (
-    <div style={{ display: "flex", gap: 8 }}>
-      <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Log today's progress…" style={{ ...input, fontSize: 12.5 }} onKeyDown={(e) => { if (e.key === "Enter") { onAdd(text); setText(""); } }} />
-      <button onClick={() => { onAdd(text); setText(""); }} style={{ ...btnGhost, padding: "6px 10px" }}>💬</button>
-    </div>
-  );
+  return (<div style={{ display: "flex", gap: 8 }}><input value={text} onChange={(e) => setText(e.target.value)} placeholder="Log today's progress…" style={{ ...input, fontSize: 12.5 }} onKeyDown={(e) => { if (e.key === "Enter") { onAdd(text); setText(""); } }} /><button onClick={() => { onAdd(text); setText(""); }} style={{ ...btnGhost, padding: "6px 10px" }}>💬</button></div>);
+}
+function AddDateField({ onAdd }) {
+  const [d, setD] = useState("");
+  return (<div style={{ display: "flex", gap: 8 }}><input type="date" value={d} onChange={(e) => setD(e.target.value)} style={{ ...input, width: 160 }} /><button onClick={() => { if (d) { onAdd(d); setD(""); } }} style={btnGhost}>Add date</button></div>);
 }
 
 function LoginScreen({ members, settings, setSettings, onLogin }) {
@@ -548,6 +838,7 @@ function LoginScreen({ members, settings, setSettings, onLogin }) {
   const [error, setError] = useState("");
   const [pick, setPick] = useState("");
   const [email, setEmail] = useState("");
+  const [tpass, setTpass] = useState("");
 
   if (mode === "setup") {
     return (<Centered><div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Set up owner access</div>
@@ -571,17 +862,19 @@ function LoginScreen({ members, settings, setSettings, onLogin }) {
     </Centered>);
   }
   return (<Centered><div style={{ fontWeight: 800, fontSize: 20, marginBottom: 6 }}>Teammate login</div>
-    <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>Pick your name and confirm your email — no password needed.</p>
+    <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>Pick your name, confirm your email and passcode.</p>
     <select value={pick} onChange={(e) => setPick(e.target.value)} style={{ ...input, marginBottom: 10 }}>
       <option value="">Select your name</option>
       {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
     </select>
     <input value={email} onChange={(e) => setEmail(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="Your email" />
+    <input type="password" value={tpass} onChange={(e) => setTpass(e.target.value)} style={{ ...input, marginBottom: 10 }} placeholder="Your passcode" />
     {error && <div style={{ color: "#dc2626", fontSize: 12.5, marginBottom: 8 }}>{error}</div>}
     <button style={{ ...btnPrimary, width: "100%" }} onClick={() => {
       const m = members.find((x) => x.id === pick);
       if (!m) { setError("Pick your name."); return; }
       if (m.email.trim().toLowerCase() !== email.trim().toLowerCase()) { setError("Email doesn't match — check with the owner."); return; }
+      if ((m.passcode || "") !== tpass) { setError("Incorrect passcode — check with the owner."); return; }
       onLogin({ role: "teammate", memberId: m.id });
     }}>Log in</button>
     <button style={{ ...btnGhost, width: "100%", justifyContent: "center", marginTop: 8 }} onClick={() => setMode("choose")}>Back</button>
